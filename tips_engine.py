@@ -38,11 +38,6 @@ def decimal_to_implied_prob(odds):
     return 1.0 / odds if odds > 0 else 0.0
 
 
-def remove_vig(probs):
-    total = sum(probs)
-    return [p / total for p in probs] if total else probs
-
-
 def value_edge(fair_prob, decimal_odds):
     return (fair_prob * decimal_odds - 1) * 100
 
@@ -116,35 +111,28 @@ def analyse_event(event):
     away = event["away_team"]
     outcome_map = get_all_outcomes(bookmakers)
 
-    if len(outcome_map) < 2:
+    if not outcome_map:
         return None
-
-    outcome_keys = list(outcome_map.keys())
-    avg_odds_list = [sum(outcome_map[k]) / len(outcome_map[k]) for k in outcome_keys]
-    raw_probs = [decimal_to_implied_prob(o) for o in avg_odds_list]
-
-    total_prob = sum(raw_probs)
-    if total_prob == 0:
-        return None
-    fair_probs = [p / total_prob for p in raw_probs]
 
     best_tip = None
     best_prob = MIN_WIN_PROB
 
-    for i, label in enumerate(outcome_keys):
-        prices = outcome_map[label]
+    for label, prices in outcome_map.items():
+        if not prices:
+            continue
+
         best_price = max(prices)
-        win_prob = round(fair_probs[i] * 100, 1)
-        edge = value_edge(fair_probs[i], best_price)
+        avg_price = sum(prices) / len(prices)
+
+        implied_prob = decimal_to_implied_prob(avg_price)
+        win_prob = round(implied_prob * 100, 1)
 
         if win_prob > best_prob:
             best_prob = win_prob
-            conf = min(5, max(1, int(win_prob / 20)))
-            implied = round(decimal_to_implied_prob(best_price) * 100, 1)
+            implied_at_best = round(decimal_to_implied_prob(best_price) * 100, 1)
             reasoning = (
-                "Our model gives this a " + str(win_prob) + "% chance of winning."
-                + " Bookmaker implies only " + str(implied) + "%."
-                + " That is a " + str(round(win_prob - implied, 1)) + "% edge in your favour."
+                "Model estimates " + str(win_prob) + "% chance based on market consensus."
+                + " Best available odds imply " + str(implied_at_best) + "%."
             )
             best_tip = {
                 "match":      home + " vs " + away,
@@ -153,7 +141,7 @@ def analyse_event(event):
                 "tip":        label,
                 "odds":       round(best_price, 2),
                 "win_prob":   win_prob,
-                "confidence": conf,
+                "confidence": min(5, max(1, int(win_prob / 20))),
                 "reasoning":  reasoning,
             }
 
@@ -191,18 +179,26 @@ async def run_diagnostic():
                 count = len(events)
                 tips_found = 0
                 top_prob = 0.0
+                top_label = ""
+
                 for event in events:
+                    outcome_map = get_all_outcomes(event.get("bookmakers", []))
+                    for label, prices in outcome_map.items():
+                        if not prices:
+                            continue
+                        avg_price = sum(prices) / len(prices)
+                        wp = round(decimal_to_implied_prob(avg_price) * 100, 1)
+                        if wp > top_prob:
+                            top_prob = wp
+                            top_label = label
+
                     tip = analyse_event(event)
                     if tip:
                         tips_found += 1
-                        if tip["win_prob"] > top_prob:
-                            top_prob = tip["win_prob"]
-                status = (
-                    sport + ": " + str(count) + " games, "
-                    + str(tips_found) + " tips"
-                )
-                if tips_found > 0:
-                    status += " (best: " + str(top_prob) + "%)"
+
+                status = sport + ": " + str(count) + " games, " + str(tips_found) + " tips"
+                if count > 0:
+                    status += " | highest prob seen: " + str(top_prob) + "% (" + top_label + ")"
                 lines.append(status)
             except Exception as e:
                 lines.append(sport + ": ERROR - " + str(e))
@@ -218,7 +214,7 @@ async def get_daily_summary():
         lines = [
             "Daily Summary",
             "",
-            "No tips with 50%+ win probability found today.",
+            "No tips found today.",
             "Try /diagnose to check what data is available.",
         ]
         return "\n".join(lines)
