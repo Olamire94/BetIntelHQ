@@ -137,7 +137,7 @@ def analyse_event(event):
         win_prob = round(fair_probs[i] * 100, 1)
         edge = value_edge(fair_probs[i], best_price)
 
-        if win_prob > best_prob and edge > 0:
+        if win_prob > best_prob:
             best_prob = win_prob
             conf = min(5, max(1, int(win_prob / 20)))
             implied = round(decimal_to_implied_prob(best_price) * 100, 1)
