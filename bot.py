@@ -1,25 +1,22 @@
 import os
 import logging
-import asyncio
-from datetime import datetime
+from datetime import datetime, time as dtime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
+Application, CommandHandler, CallbackQueryHandler,
+ContextTypes,
 )
 from tips_engine import get_tips, get_daily_summary
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-format="%(asctime)s | %(levelname)s | %(message)s",
-level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-# ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "YOUR_CHANNEL_ID_HERE") # e.g. @mybettingchannel
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) # your Telegram user ID
-# ── Helpers ───────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0").strip())
+if not BOT_TOKEN:
+if not CHANNEL_ID:
+raise RuntimeError("BOT_TOKEN environment variable is not set.")
+raise RuntimeError("CHANNEL_ID environment variable is not set.")
 def tip_card(tip: dict) -> str:
-"""Format a single tip as a Telegram message."""
 stars = " " * tip.get("confidence", 3)
 arrow = " " if tip.get("value_edge", 0) >= 10 else " "
 return (
@@ -35,7 +32,6 @@ f" {tip['reasoning']}\n"
 f"━━━━━━━━━━━━━━━━━━━━━━\n"
 f" _Gamble responsibly. 18+_"
 )
-# ── Command Handlers ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 kb = [
 [InlineKeyboardButton(" Today's Tips", callback_data="tips")],
@@ -43,94 +39,90 @@ kb = [
 [InlineKeyboardButton(" How It Works", callback_data="howto")],
 ]
 await update.message.reply_text(
-" *Value Bet Bot*\n\n"
-"I analyse odds from major bookmakers and surface bets where the _true probability_ "
-"is higher than the implied odds suggest — giving you a mathematical edge.\n\n"
-"Use the buttons below to get started:",
-parse_mode="Markdown",
+" *Value Bet Bot*\n\nI scan bookmakers for bets where the _true probability_ parse_mode="Markdown",
 reply_markup=InlineKeyboardMarkup(kb),
+beats
 )
 async def tips_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 msg = await update.message.reply_text(" Fetching value tips…")
+try:
 tips = await get_tips()
+except Exception as e:
+logger.error("get_tips failed: %s", e)
+await msg.edit_text(" return
+Error fetching tips. Check your ODDS_API_KEY.")
 if not tips:
-await msg.edit_text(" No strong value bets found right now. Check back later!")
-return
-for tip in tips:
+await msg.edit_text(" return
+No strong value bets found right now.")
 await msg.delete()
+for tip in tips:
 await update.message.reply_text(tip_card(tip), parse_mode="Markdown")
 async def summary_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+try:
 text = await get_daily_summary()
+except Exception as e:
+logger.error("summary failed: %s", e)
+text = " Error fetching summary. Check your ODDS_API_KEY."
 await update.message.reply_text(text, parse_mode="Markdown")
-# ── Callback (inline button) handler ─────────────────────────────────────────
 async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 query = update.callback_query
 await query.answer()
 if query.data == "tips":
+try:
 tips = await get_tips()
-if not tips:
+except Exception:
 await query.edit_message_text(" return
-No strong value bets found right now.")
-await query.edit_message_text("Here are today's value bets for tip in tips:
-")
+Error fetching tips. Check your ODDS_API_KEY.")
+if not tips:
+return
+await query.edit_message_text(" No strong value bets right now.")
+await query.edit_message_text("Here are today's value bets ")
+for tip in tips:
 await query.message.reply_text(tip_card(tip), parse_mode="Markdown")
 elif query.data == "summary":
 text = await get_daily_summary()
 await query.edit_message_text(text, parse_mode="Markdown")
 elif query.data == "howto":
 await query.edit_message_text(
-" *How Value Betting Works*\n\n"
-"Bookmakers set odds that include a margin (their profit). "
-"A *value bet* exists when we calculate the true probability of an outcome "
-"is higher than what the odds imply.\n\n"
-"*Example:*\n"
-"• Bookie odds: 2.50 → implied probability = 40%\n"
-"• Our model: true probability = 50%\n"
-"• Value Edge = +10% \n\n"
-"Consistently backing +EV (positive expected value) bets "
-"produces profit over the long run.\n\n"
-" _Short-term variance is normal — always manage your bankroll._",
+" *How Value Betting Works*\n\nBookmakers set odds including their profit margi
+"A *value bet* exists when our model finds the true probability is higher than th
+"*Example:*\n• Bookie odds: 2.50 → implied 40%\n• Our model: true prob 50%\n• Edg
+" _Always manage your bankroll responsibly._",
 parse_mode="Markdown",
 )
-# ── Scheduled broadcast ───────────────────────────────────────────────────────
 async def broadcast_tips(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-"""Automatically push tips to the channel."""
+try:
 tips = await get_tips()
-if not tips:
-logger.info("Scheduled broadcast: no tips to send.")
+except Exception as e:
+logger.error("Broadcast failed: %s", e)
 return
-header = (
-f" *Daily Value Tips — {datetime.now().strftime('%d %b %Y')}*\n"
-f"Found *{len(tips)}* value bet(s) today \n"
-)
+if not tips:
+logger.info("Broadcast: no tips today.")
+return
+header = f" try:
+*Daily Value Tips — {datetime.now().strftime('%d %b %Y')}*\nFound *{len(tip
 await ctx.bot.send_message(CHANNEL_ID, header, parse_mode="Markdown")
 for tip in tips:
 await ctx.bot.send_message(CHANNEL_ID, tip_card(tip), parse_mode="Markdown")
-logger.info("Broadcast sent: %d tips.", len(tips))
-# ── Admin: manual push ────────────────────────────────────────────────────────
+logger.info("Broadcast: %d tips sent.", len(tips))
+except Exception as e:
+logger.error("Channel send failed: %s", e)
 async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 if update.effective_user.id != ADMIN_ID:
 await update.message.reply_text(" Admin only.")
 return
+await update.message.reply_text(" Pushing tips…")
 await broadcast_tips(ctx)
-await update.message.reply_text(" Tips pushed to channel.")
-# ── Main ──────────────────────────────────────────────────────────────────────
+await update.message.reply_text(" Done.")
 def main() -> None:
 app = Application.builder().token(BOT_TOKEN).build()
-# Commands
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("tips", tips_command))
 app.add_handler(CommandHandler("summary", summary_command))
 app.add_handler(CommandHandler("push", push))
-# Inline buttons
 app.add_handler(CallbackQueryHandler(button))
-# Scheduled job — broadcasts every day at 08:00 UTC
-job_queue: JobQueue = app.job_queue
-job_queue.run_daily(
-broadcast_tips,
-time=datetime.strptime("08:00", "%H:%M").time(),
-)
-logger.info("Bot is running…")
+app.job_queue.run_daily(broadcast_tips, time=dtime(hour=8, minute=0))
+logger.info(" Bot running.")
 app.run_polling(drop_pending_updates=True)
 if __name__ == "__main__":
 main()
