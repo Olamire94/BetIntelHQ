@@ -29,6 +29,7 @@ SOCCER_SPORTS = [
 ]
 
 MIN_WIN_PROB     = 50.0
+MAX_WIN_PROB     = 70.0
 MAX_TIPS_PER_RUN = 5
 MIN_ODDS         = 1.1
 MAX_ODDS         = 99.0
@@ -127,7 +128,7 @@ def analyse_event(event):
         implied_prob = decimal_to_implied_prob(avg_price)
         win_prob = round(implied_prob * 100, 1)
 
-        if win_prob > best_prob:
+        if win_prob > best_prob and win_prob <= MAX_WIN_PROB:
             best_prob = win_prob
             implied_at_best = round(decimal_to_implied_prob(best_price) * 100, 1)
             reasoning = (
