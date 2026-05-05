@@ -28,10 +28,10 @@ SOCCER_SPORTS = [
     "soccer_uefa_champs_league",
 ]
 
-MIN_VALUE_EDGE   = 5.0
+MIN_WIN_PROB     = 50.0
 MAX_TIPS_PER_RUN = 5
-MIN_ODDS         = 1.5
-MAX_ODDS         = 4.0
+MIN_ODDS         = 1.1
+MAX_ODDS         = 2.5
 
 
 def decimal_to_implied_prob(odds):
@@ -127,24 +127,22 @@ def analyse_event(event):
     fair_probs = [p / total_prob for p in raw_probs]
 
     best_tip = None
-    best_edge = MIN_VALUE_EDGE
+    best_prob = MIN_WIN_PROB
 
     for i, label in enumerate(outcome_keys):
         prices = outcome_map[label]
         best_price = max(prices)
-
-        if best_price < MIN_ODDS or best_price > MAX_ODDS:
-            continue
-
+        win_prob = round(fair_probs[i] * 100, 1)
         edge = value_edge(fair_probs[i], best_price)
-        if edge > best_edge:
-            best_edge = edge
-            conf = min(5, max(1, int(edge / 4)))
-            fp_pct = str(round(fair_probs[i] * 100, 1))
-            ip_pct = str(round(decimal_to_implied_prob(best_price) * 100, 1))
+
+        if win_prob > best_prob and edge > 0:
+            best_prob = win_prob
+            conf = min(5, max(1, int(win_prob / 20)))
+            implied = round(decimal_to_implied_prob(best_price) * 100, 1)
             reasoning = (
-                "Fair probability " + fp_pct + "% vs implied "
-                + ip_pct + "%. Edge: +" + str(round(edge, 1)) + "%."
+                "Our model gives this a " + str(win_prob) + "% chance of winning."
+                + " Bookmaker implies only " + str(implied) + "%."
+                + " That is a " + str(round(win_prob - implied, 1)) + "% edge in your favour."
             )
             best_tip = {
                 "match":      home + " vs " + away,
@@ -152,7 +150,7 @@ def analyse_event(event):
                 "date":       fmt_date(event.get("commence_time", "")),
                 "tip":        label,
                 "odds":       round(best_price, 2),
-                "value_edge": round(edge, 1),
+                "win_prob":   win_prob,
                 "confidence": conf,
                 "reasoning":  reasoning,
             }
@@ -171,7 +169,7 @@ async def get_tips():
             tip = analyse_event(event)
             if tip:
                 all_tips.append(tip)
-    all_tips.sort(key=lambda t: t["value_edge"], reverse=True)
+    all_tips.sort(key=lambda t: t["win_prob"], reverse=True)
     return all_tips[:MAX_TIPS_PER_RUN]
 
 
@@ -181,27 +179,27 @@ async def get_daily_summary():
         lines = [
             "Daily Summary",
             "",
-            "No value bets found today.",
-            "Markets look sharp - patience pays.",
+            "No tips with 60%+ win probability found today.",
+            "Check back tomorrow.",
         ]
         return "\n".join(lines)
 
-    avg_edge = sum(t["value_edge"] for t in tips) / len(tips)
+    avg_prob = sum(t["win_prob"] for t in tips) / len(tips)
     avg_odds = sum(t["odds"] for t in tips) / len(tips)
 
     lines = [
         "Daily Summary - " + datetime.now().strftime("%d %b %Y"),
         "",
-        "Value bets found: " + str(len(tips)),
-        "Avg value edge: +" + str(round(avg_edge, 1)) + "%",
-        "Avg best odds: " + str(round(avg_odds, 2)),
+        "Tips found: " + str(len(tips)),
+        "Avg win probability: " + str(round(avg_prob, 1)) + "%",
+        "Avg odds: " + str(round(avg_odds, 2)),
         "",
         "Top picks today:",
     ]
     for i, t in enumerate(tips, 1):
         lines.append(
             str(i) + ". " + t["match"] + " - " + t["tip"]
-            + " @ " + str(t["odds"]) + " (+" + str(t["value_edge"]) + "%)"
+            + " @ " + str(t["odds"]) + " (" + str(t["win_prob"]) + "% win prob)"
         )
     lines.append("")
     lines.append("Gamble responsibly.")
