@@ -20,10 +20,18 @@ SPORTS = [
     "baseball_mlb",
 ]
 
-MIN_VALUE_EDGE   = 2.0
+SOCCER_SPORTS = [
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_germany_bundesliga",
+    "soccer_italy_serie_a",
+    "soccer_uefa_champs_league",
+]
+
+MIN_VALUE_EDGE   = 5.0
 MAX_TIPS_PER_RUN = 5
 MIN_ODDS         = 1.5
-MAX_ODDS         = 2.0
+MAX_ODDS         = 4.0
 
 
 def decimal_to_implied_prob(odds):
@@ -40,35 +48,27 @@ def value_edge(fair_prob, decimal_odds):
 
 
 async def fetch_odds(sport, session):
+    is_soccer = sport in SOCCER_SPORTS
+    markets = "h2h,totals,spreads"
+    if is_soccer:
+        markets = "h2h,totals,btts,spreads"
+
     url = (
         ODDS_API_BASE + "/sports/" + sport + "/odds"
         + "?apiKey=" + ODDS_API_KEY
         + "&regions=uk,eu"
-        + "&markets=h2h"
+        + "&markets=" + markets
         + "&oddsFormat=decimal"
         + "&dateFormat=iso"
     )
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
-                return await resp.json()
+                return await resp.json(), sport
             logger.warning("Odds API %s returned %d", sport, resp.status)
     except Exception as exc:
         logger.error("fetch_odds error (%s): %s", sport, exc)
-    return []
-
-
-def best_odds_for_outcome(bookmakers, outcome_name):
-    best = None
-    for bm in bookmakers:
-        for market in bm.get("markets", []):
-            if market.get("key") != "h2h":
-                continue
-            for o in market.get("outcomes", []):
-                if o["name"] == outcome_name:
-                    if best is None or o["price"] > best["price"]:
-                        best = {"bookmaker": bm["title"], "price": o["price"]}
-    return best
+    return [], sport
 
 
 def fmt_date(iso):
@@ -79,6 +79,32 @@ def fmt_date(iso):
         return iso
 
 
+def get_all_outcomes(bookmakers):
+    outcome_map = {}
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            mkey = market.get("key")
+            for o in market.get("outcomes", []):
+                name = o["name"]
+                price = o["price"]
+                point = o.get("point", None)
+
+                if mkey == "totals":
+                    label = name + " " + str(point) + " goals/runs"
+                elif mkey == "btts":
+                    label = "BTTS " + name
+                elif mkey == "spreads":
+                    sign = "+" if point and point > 0 else ""
+                    label = name + " handicap " + sign + str(point)
+                else:
+                    label = name + " to win"
+
+                if label not in outcome_map:
+                    outcome_map[label] = []
+                outcome_map[label].append(price)
+    return outcome_map
+
+
 def analyse_event(event):
     bookmakers = event.get("bookmakers", [])
     if not bookmakers:
@@ -86,56 +112,46 @@ def analyse_event(event):
 
     home = event["home_team"]
     away = event["away_team"]
-    outcomes = [home, away, "Draw"]
+    outcome_map = get_all_outcomes(bookmakers)
 
-    avg_odds = {}
-    for outcome in outcomes:
-        prices = []
-        for bm in bookmakers:
-            for market in bm.get("markets", []):
-                if market.get("key") != "h2h":
-                    continue
-                for o in market.get("outcomes", []):
-                    if o["name"] == outcome:
-                        prices.append(o["price"])
-        if prices:
-            avg_odds[outcome] = sum(prices) / len(prices)
-
-    if len(avg_odds) < 2:
+    if len(outcome_map) < 2:
         return None
 
-    raw_probs = [decimal_to_implied_prob(avg_odds[k]) for k in avg_odds]
-    fair_probs = remove_vig(raw_probs)
-    outcome_keys = list(avg_odds.keys())
+    outcome_keys = list(outcome_map.keys())
+    avg_odds_list = [sum(outcome_map[k]) / len(outcome_map[k]) for k in outcome_keys]
+    raw_probs = [decimal_to_implied_prob(o) for o in avg_odds_list]
+
+    total_prob = sum(raw_probs)
+    if total_prob == 0:
+        return None
+    fair_probs = [p / total_prob for p in raw_probs]
 
     best_tip = None
     best_edge = MIN_VALUE_EDGE
 
-    for i, outcome in enumerate(outcome_keys):
-        best = best_odds_for_outcome(bookmakers, outcome)
-        if not best:
+    for i, label in enumerate(outcome_keys):
+        prices = outcome_map[label]
+        best_price = max(prices)
+
+        if best_price < MIN_ODDS or best_price > MAX_ODDS:
             continue
-        if best["price"] < MIN_ODDS or best["price"] > MAX_ODDS:
-            continue
-        edge = value_edge(fair_probs[i], best["price"])
+
+        edge = value_edge(fair_probs[i], best_price)
         if edge > best_edge:
             best_edge = edge
             conf = min(5, max(1, int(edge / 4)))
-            tip_label = outcome + " to win" if outcome != "Draw" else "Draw"
             fp_pct = str(round(fair_probs[i] * 100, 1))
-            ip_pct = str(round(decimal_to_implied_prob(best["price"]) * 100, 1))
+            ip_pct = str(round(decimal_to_implied_prob(best_price) * 100, 1))
             reasoning = (
                 "Fair probability " + fp_pct + "% vs implied "
-                + ip_pct + "% at " + best["bookmaker"]
-                + ". Edge: +" + str(round(edge, 1)) + "%."
+                + ip_pct + "%. Edge: +" + str(round(edge, 1)) + "%."
             )
             best_tip = {
                 "match":      home + " vs " + away,
                 "league":     event.get("sport_title", ""),
                 "date":       fmt_date(event.get("commence_time", "")),
-                "tip":        tip_label,
-                "odds":       round(best["price"], 2),
-                "bookmaker":  best["bookmaker"],
+                "tip":        label,
+                "odds":       round(best_price, 2),
                 "value_edge": round(edge, 1),
                 "confidence": conf,
                 "reasoning":  reasoning,
@@ -149,7 +165,8 @@ async def get_tips():
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_odds(sport, session) for sport in SPORTS]
         results = await asyncio.gather(*tasks)
-    for events in results:
+    for result in results:
+        events, sport = result
         for event in events:
             tip = analyse_event(event)
             if tip:
