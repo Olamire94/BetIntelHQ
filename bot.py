@@ -20,12 +20,22 @@ if not BOT_TOKEN:
 if not CHANNEL_ID:
     raise RuntimeError("CHANNEL_ID environment variable is not set.")
 
+DAILY_TIP_LIMIT = 6
+sent_today = {"date": "", "count": 0, "sent_ids": set()}
+
+
+def reset_if_new_day():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if sent_today["date"] != today:
+        sent_today["date"] = today
+        sent_today["count"] = 0
+        sent_today["sent_ids"] = set()
+
 
 def tip_card(tip):
     prob = str(tip.get("win_prob", "?")) + "%"
     bar_filled = int(tip.get("win_prob", 0) / 10)
     bar = "#" * bar_filled + "-" * (10 - bar_filled)
-
     lines = [
         "----------------------",
         tip["match"],
@@ -42,6 +52,10 @@ def tip_card(tip):
     return "\n".join(lines)
 
 
+def tip_id(tip):
+    return tip["match"] + "|" + tip["tip"]
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("Today's Tips",  callback_data="tips")],
@@ -49,7 +63,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("How It Works",   callback_data="howto")],
     ]
     await update.message.reply_text(
-        "Value Bet Bot\n\nI find bets with the highest probability of winning across football, NBA, NFL and MLB.\n\nUse the buttons below:",
+        "Value Bet Bot\n\nI scan for high probability betting opportunities throughout the day and alert your channel as they appear. Max 6 tips per day.\n\nUse the buttons below:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -63,7 +77,7 @@ async def tips_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("Error fetching tips: " + str(e))
         return
     if not tips:
-        await msg.edit_text("No tips found right now. Try /diagnose to check the API connection.")
+        await msg.edit_text("No tips found right now. Try again later or use /diagnose.")
         return
     await msg.delete()
     for tip in tips:
@@ -74,8 +88,9 @@ async def summary_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         text = await get_daily_summary()
     except Exception as e:
-        logger.error("summary failed: %s", e)
         text = "Error fetching summary: " + str(e)
+    reset_if_new_day()
+    text += "\nTips sent today: " + str(sent_today["count"]) + "/" + str(DAILY_TIP_LIMIT)
     await update.message.reply_text(text)
 
 
@@ -99,9 +114,9 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Error fetching tips: " + str(e))
             return
         if not tips:
-            await query.edit_message_text("No tips found right now. Try /diagnose to check the connection.")
+            await query.edit_message_text("No tips right now. Try again later.")
             return
-        await query.edit_message_text("Here are today's top tips:")
+        await query.edit_message_text("Latest tips:")
         for tip in tips:
             await query.message.reply_text(tip_card(tip))
     elif query.data == "summary":
@@ -110,34 +125,45 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif query.data == "howto":
         await query.edit_message_text(
             "How It Works\n\n"
-            "Bookmakers build a profit margin into every odds price.\n"
-            "Our model strips that margin out to find the true probability of each outcome.\n\n"
-            "Example:\n"
-            "Bookie odds: 2.50 implies a 40% chance\n"
-            "Our model says: true chance is 55%\n"
-            "Result: a high probability tip\n\n"
-            "We only show tips where our model gives 50% or higher win probability.\n\n"
+            "The bot scans bookmakers every 2 hours throughout the day.\n"
+            "When it finds a bet with 50-70% win probability it sends it to the channel.\n"
+            "Maximum 6 tips are sent per day.\n\n"
+            "Win probability is calculated by stripping out the bookmaker margin "
+            "to find the true chance of each outcome.\n\n"
             "Always manage your bankroll responsibly."
         )
 
 
-async def broadcast_tips(ctx: ContextTypes.DEFAULT_TYPE):
+async def scan_and_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
+    reset_if_new_day()
+
+    if sent_today["count"] >= DAILY_TIP_LIMIT:
+        logger.info("Daily tip limit reached (%d). Skipping scan.", DAILY_TIP_LIMIT)
+        return
+
     try:
         tips = await get_tips()
     except Exception as e:
-        logger.error("Broadcast failed: %s", e)
+        logger.error("Scan failed: %s", e)
         return
+
     if not tips:
-        logger.info("Broadcast: no tips today.")
+        logger.info("Scan: no tips found.")
         return
-    header = "Daily Tips - " + datetime.now().strftime("%d %b %Y") + "\nTop " + str(len(tips)) + " picks today\n"
-    try:
-        await ctx.bot.send_message(CHANNEL_ID, header)
-        for tip in tips:
+
+    for tip in tips:
+        if sent_today["count"] >= DAILY_TIP_LIMIT:
+            break
+        tid = tip_id(tip)
+        if tid in sent_today["sent_ids"]:
+            continue
+        try:
             await ctx.bot.send_message(CHANNEL_ID, tip_card(tip))
-        logger.info("Broadcast: %d tips sent.", len(tips))
-    except Exception as e:
-        logger.error("Channel send failed: %s", e)
+            sent_today["sent_ids"].add(tid)
+            sent_today["count"] += 1
+            logger.info("Sent tip %d/%d: %s", sent_today["count"], DAILY_TIP_LIMIT, tid)
+        except Exception as e:
+            logger.error("Failed to send tip: %s", e)
 
 
 async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -145,19 +171,25 @@ async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Admin only.")
         return
     await update.message.reply_text("Pushing tips...")
-    await broadcast_tips(ctx)
-    await update.message.reply_text("Done.")
+    await scan_and_broadcast(ctx)
+    await update.message.reply_text("Done. Tips sent today: " + str(sent_today["count"]) + "/" + str(DAILY_TIP_LIMIT))
 
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("tips",    tips_command))
-    app.add_handler(CommandHandler("summary", summary_command))
-    app.add_handler(CommandHandler("push",    push))
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("tips",     tips_command))
+    app.add_handler(CommandHandler("summary",  summary_command))
+    app.add_handler(CommandHandler("push",     push))
     app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CallbackQueryHandler(button))
-    app.job_queue.run_daily(broadcast_tips, time=dtime(hour=8, minute=0))
+
+    scan_times = ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"]
+    for t in scan_times:
+        h, m = int(t.split(":")[0]), int(t.split(":")[1])
+        app.job_queue.run_daily(scan_and_broadcast, time=dtime(hour=h, minute=m))
+        logger.info("Scheduled scan at %s UTC", t)
+
     logger.info("Bot running.")
     app.run_polling(drop_pending_updates=True)
 
