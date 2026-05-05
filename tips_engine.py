@@ -17,9 +17,10 @@ SPORTS = [
     "soccer_uefa_champs_league",
     "basketball_nba",
     "americanfootball_nfl",
+    "baseball_mlb",
 ]
 
-MIN_VALUE_EDGE   = 5.0
+MIN_VALUE_EDGE   = 2.0
 MAX_TIPS_PER_RUN = 5
 MIN_ODDS         = 1.5
 MAX_ODDS         = 2.0
