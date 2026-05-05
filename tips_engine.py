@@ -31,7 +31,7 @@ SOCCER_SPORTS = [
 MIN_WIN_PROB     = 50.0
 MAX_TIPS_PER_RUN = 5
 MIN_ODDS         = 1.1
-MAX_ODDS         = 2.5
+MAX_ODDS         = 99.0
 
 
 def decimal_to_implied_prob(odds):
@@ -64,8 +64,10 @@ async def fetch_odds(sport, session):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
-                return await resp.json(), sport
+                data = await resp.json()
+                return data, sport
             logger.warning("Odds API %s returned %d", sport, resp.status)
+            return [], sport
     except Exception as exc:
         logger.error("fetch_odds error (%s): %s", sport, exc)
     return [], sport
@@ -173,14 +175,51 @@ async def get_tips():
     return all_tips[:MAX_TIPS_PER_RUN]
 
 
+async def run_diagnostic():
+    lines = ["Diagnostic Report", ""]
+    if not ODDS_API_KEY:
+        lines.append("ERROR: ODDS_API_KEY is not set.")
+        return "\n".join(lines)
+
+    lines.append("API Key: set (" + ODDS_API_KEY[:6] + "...)")
+    lines.append("")
+
+    async with aiohttp.ClientSession() as session:
+        for sport in SPORTS:
+            try:
+                events, _ = await fetch_odds(sport, session)
+                count = len(events)
+                tips_found = 0
+                top_prob = 0.0
+                for event in events:
+                    tip = analyse_event(event)
+                    if tip:
+                        tips_found += 1
+                        if tip["win_prob"] > top_prob:
+                            top_prob = tip["win_prob"]
+                status = (
+                    sport + ": " + str(count) + " games, "
+                    + str(tips_found) + " tips"
+                )
+                if tips_found > 0:
+                    status += " (best: " + str(top_prob) + "%)"
+                lines.append(status)
+            except Exception as e:
+                lines.append(sport + ": ERROR - " + str(e))
+
+    lines.append("")
+    lines.append("Min win prob threshold: " + str(MIN_WIN_PROB) + "%")
+    return "\n".join(lines)
+
+
 async def get_daily_summary():
     tips = await get_tips()
     if not tips:
         lines = [
             "Daily Summary",
             "",
-            "No tips with 60%+ win probability found today.",
-            "Check back tomorrow.",
+            "No tips with 50%+ win probability found today.",
+            "Try /diagnose to check what data is available.",
         ]
         return "\n".join(lines)
 
