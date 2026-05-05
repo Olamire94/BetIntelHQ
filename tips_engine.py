@@ -22,7 +22,7 @@ SPORTS = [
 MIN_VALUE_EDGE   = 5.0
 MAX_TIPS_PER_RUN = 5
 MIN_ODDS         = 1.5
-MAX_ODDS         = 4.0
+MAX_ODDS         = 2.0
 
 
 def decimal_to_implied_prob(odds):
