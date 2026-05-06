@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,18 @@ SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
+    "soccer_france_ligue_one",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
+    "soccer_turkey_super_league",
+    "soccer_brazil_campeonato",
+    "soccer_argentina_primera_division",
+    "soccer_mexico_ligamx",
+    "soccer_usa_mls",
+    "soccer_uefa_europa_league",
+    "soccer_england_efl_champ",
+    "soccer_australia_aleague",
+    "soccer_japan_j_league",
     "basketball_nba",
     "americanfootball_nfl",
     "baseball_mlb",
@@ -26,6 +38,18 @@ SOCCER_SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
+    "soccer_france_ligue_one",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
+    "soccer_turkey_super_league",
+    "soccer_brazil_campeonato",
+    "soccer_argentina_primera_division",
+    "soccer_mexico_ligamx",
+    "soccer_usa_mls",
+    "soccer_uefa_europa_league",
+    "soccer_england_efl_champ",
+    "soccer_australia_aleague",
+    "soccer_japan_j_league",
 ]
 
 MIN_WIN_PROB     = 50.0
@@ -72,7 +96,8 @@ async def fetch_odds(sport, session):
 def fmt_date(iso):
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%d %b %Y %H:%M UTC")
+        EST = timezone(timedelta(hours=-5))
+        return dt.astimezone(EST).strftime("%d %b %Y %H:%M EST")
     except Exception:
         return iso
 
@@ -124,7 +149,6 @@ def analyse_event(event):
 
         best_price = max(prices)
         avg_price = sum(prices) / len(prices)
-
         implied_prob = decimal_to_implied_prob(avg_price)
         win_prob = round(implied_prob * 100, 1)
 
@@ -199,13 +223,13 @@ async def run_diagnostic():
 
                 status = sport + ": " + str(count) + " games, " + str(tips_found) + " tips"
                 if count > 0:
-                    status += " | highest prob seen: " + str(top_prob) + "% (" + top_label + ")"
+                    status += " | best: " + str(top_prob) + "% (" + top_label + ")"
                 lines.append(status)
             except Exception as e:
                 lines.append(sport + ": ERROR - " + str(e))
 
     lines.append("")
-    lines.append("Min win prob threshold: " + str(MIN_WIN_PROB) + "%")
+    lines.append("Win prob range: " + str(MIN_WIN_PROB) + "% - " + str(MAX_WIN_PROB) + "%")
     return "\n".join(lines)
 
 
