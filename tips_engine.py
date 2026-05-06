@@ -30,7 +30,7 @@ SOCCER_SPORTS = [
 
 MIN_WIN_PROB     = 50.0
 MAX_WIN_PROB     = 70.0
-MAX_TIPS_PER_RUN = 5
+MAX_TIPS_PER_RUN = 3
 MIN_ODDS         = 1.1
 MAX_ODDS         = 99.0
 
