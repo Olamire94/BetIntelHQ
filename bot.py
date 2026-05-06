@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -21,11 +21,12 @@ if not CHANNEL_ID:
     raise RuntimeError("CHANNEL_ID environment variable is not set.")
 
 DAILY_TIP_LIMIT = 12
+EST = timezone(timedelta(hours=-5))
 sent_today = {"date": "", "count": 0, "sent_ids": set()}
 
 
 def reset_if_new_day():
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(EST).strftime("%Y-%m-%d")
     if sent_today["date"] != today:
         sent_today["date"] = today
         sent_today["count"] = 0
@@ -63,7 +64,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("How It Works",   callback_data="howto")],
     ]
     await update.message.reply_text(
-        "Value Bet Bot\n\nI scan for high probability betting opportunities throughout the day and alert your channel as they appear. Max 6 tips per day.\n\nUse the buttons below:",
+        "Value Bet Bot\n\nI scan for high probability betting opportunities throughout the day and alert your channel as they appear. Max 12 tips per day.\n\nUse the buttons below:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -125,9 +126,9 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif query.data == "howto":
         await query.edit_message_text(
             "How It Works\n\n"
-            "The bot scans bookmakers every 2 hours throughout the day.\n"
+            "The bot scans bookmakers every 2 hours throughout the day (EST).\n"
             "When it finds a bet with 50-70% win probability it sends it to the channel.\n"
-            "Maximum 6 tips are sent per day.\n\n"
+            "Maximum 12 tips are sent per day.\n\n"
             "Win probability is calculated by stripping out the bookmaker margin "
             "to find the true chance of each outcome.\n\n"
             "Always manage your bankroll responsibly."
@@ -184,13 +185,30 @@ def main():
     app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CallbackQueryHandler(button))
 
-    scan_times = ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"]
-    for t in scan_times:
-        h, m = int(t.split(":")[0]), int(t.split(":")[1])
-        app.job_queue.run_daily(scan_and_broadcast, time=dtime(hour=h, minute=m))
-        logger.info("Scheduled scan at %s UTC", t)
+    # Scan times in EST (UTC-5) converted to UTC for scheduling
+    # EST 02:00 = UTC 07:00
+    # EST 08:00 = UTC 13:00
+    # EST 10:00 = UTC 15:00
+    # EST 12:00 = UTC 17:00
+    # EST 14:00 = UTC 19:00
+    # EST 16:00 = UTC 21:00
+    # EST 18:00 = UTC 23:00
+    # EST 20:00 = UTC 01:00
+    scan_times_utc = [
+        (7,  0),
+        (9,  0),
+        (11, 0),
+        (13, 0),
+        (15, 0),
+        (17, 0),
+        (19, 0),
+        (23, 0),
+    ]
 
-    logger.info("Bot running.")
+    for h, m in scan_times_utc:
+        app.job_queue.run_daily(scan_and_broadcast, time=dtime(hour=h, minute=m))
+
+    logger.info("Bot running. Scans at 02:00 04:00 06:00 08:00 10:00 12:00 14:00 18:00 EST")
     app.run_polling(drop_pending_updates=True)
 
 
