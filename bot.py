@@ -20,7 +20,7 @@ if not BOT_TOKEN:
 if not CHANNEL_ID:
     raise RuntimeError("CHANNEL_ID environment variable is not set.")
 
-DAILY_TIP_LIMIT = 6
+DAILY_TIP_LIMIT = 12
 sent_today = {"date": "", "count": 0, "sent_ids": set()}
 
 
