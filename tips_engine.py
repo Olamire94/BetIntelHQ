@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 ODDS_API_KEY  = os.environ.get("ODDS_API_KEY", "").strip()
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+EST = timezone(timedelta(hours=-5))
 
 SPORTS = [
     "soccer_epl",
@@ -15,16 +16,6 @@ SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
-    "soccer_france_ligue_one",
-    "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga",
-    "soccer_turkey_super_league",
-    "soccer_brazil_campeonato",
-    "soccer_argentina_primera_division",
-    "soccer_mexico_ligamx",
-    "soccer_usa_mls",
-    "soccer_uefa_europa_league",
-    "soccer_england_efl_champ",
     "soccer_australia_aleague",
     "soccer_japan_j_league",
     "basketball_nba",
@@ -38,25 +29,13 @@ SOCCER_SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
-    "soccer_france_ligue_one",
-    "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga",
-    "soccer_turkey_super_league",
-    "soccer_brazil_campeonato",
-    "soccer_argentina_primera_division",
-    "soccer_mexico_ligamx",
-    "soccer_usa_mls",
-    "soccer_uefa_europa_league",
-    "soccer_england_efl_champ",
     "soccer_australia_aleague",
     "soccer_japan_j_league",
 ]
 
-MIN_WIN_PROB     = 50.0
-MAX_WIN_PROB     = 70.0
-MAX_TIPS_PER_RUN = 3
-MIN_ODDS         = 1.1
-MAX_ODDS         = 99.0
+MIN_ODDS = 1.30
+MAX_ODDS = 1.50
+MAX_TIPS_PER_RUN = 10
 
 
 def decimal_to_implied_prob(odds):
@@ -96,7 +75,6 @@ async def fetch_odds(sport, session):
 def fmt_date(iso):
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        EST = timezone(timedelta(hours=-5))
         return dt.astimezone(EST).strftime("%d %b %Y %H:%M EST")
     except Exception:
         return iso
@@ -131,46 +109,47 @@ def get_all_outcomes(bookmakers):
 def analyse_event(event):
     bookmakers = event.get("bookmakers", [])
     if not bookmakers:
-        return None
+        return []
 
     home = event["home_team"]
     away = event["away_team"]
     outcome_map = get_all_outcomes(bookmakers)
 
     if not outcome_map:
-        return None
+        return []
 
-    best_tip = None
-    best_prob = MIN_WIN_PROB
-
+    tips = []
     for label, prices in outcome_map.items():
         if not prices:
             continue
 
         best_price = max(prices)
         avg_price = sum(prices) / len(prices)
-        implied_prob = decimal_to_implied_prob(avg_price)
-        win_prob = round(implied_prob * 100, 1)
 
-        if win_prob > best_prob and win_prob <= MAX_WIN_PROB:
-            best_prob = win_prob
-            implied_at_best = round(decimal_to_implied_prob(best_price) * 100, 1)
-            reasoning = (
-                "Model estimates " + str(win_prob) + "% chance based on market consensus."
-                + " Best available odds imply " + str(implied_at_best) + "%."
-            )
-            best_tip = {
-                "match":      home + " vs " + away,
-                "league":     event.get("sport_title", ""),
-                "date":       fmt_date(event.get("commence_time", "")),
-                "tip":        label,
-                "odds":       round(best_price, 2),
-                "win_prob":   win_prob,
-                "confidence": min(5, max(1, int(win_prob / 20))),
-                "reasoning":  reasoning,
-            }
+        if best_price < MIN_ODDS or best_price > MAX_ODDS:
+            continue
 
-    return best_tip
+        win_prob = round(decimal_to_implied_prob(avg_price) * 100, 1)
+        implied_at_best = round(decimal_to_implied_prob(best_price) * 100, 1)
+
+        reasoning = (
+            "Market consensus probability: " + str(win_prob) + "%."
+            + " Best odds imply: " + str(implied_at_best) + "%."
+        )
+
+        tips.append({
+            "match":      home + " vs " + away,
+            "league":     event.get("sport_title", ""),
+            "date":       fmt_date(event.get("commence_time", "")),
+            "tip":        label,
+            "odds":       round(best_price, 2),
+            "win_prob":   win_prob,
+            "confidence": min(5, max(1, int(win_prob / 20))),
+            "reasoning":  reasoning,
+        })
+
+    tips.sort(key=lambda t: t["win_prob"], reverse=True)
+    return tips[:1]
 
 
 async def get_tips():
@@ -181,9 +160,8 @@ async def get_tips():
     for result in results:
         events, sport = result
         for event in events:
-            tip = analyse_event(event)
-            if tip:
-                all_tips.append(tip)
+            tips = analyse_event(event)
+            all_tips.extend(tips)
     all_tips.sort(key=lambda t: t["win_prob"], reverse=True)
     return all_tips[:MAX_TIPS_PER_RUN]
 
@@ -195,6 +173,7 @@ async def run_diagnostic():
         return "\n".join(lines)
 
     lines.append("API Key: set (" + ODDS_API_KEY[:6] + "...)")
+    lines.append("Odds range: " + str(MIN_ODDS) + " - " + str(MAX_ODDS))
     lines.append("")
 
     async with aiohttp.ClientSession() as session:
@@ -203,33 +182,15 @@ async def run_diagnostic():
                 events, _ = await fetch_odds(sport, session)
                 count = len(events)
                 tips_found = 0
-                top_prob = 0.0
-                top_label = ""
-
                 for event in events:
-                    outcome_map = get_all_outcomes(event.get("bookmakers", []))
-                    for label, prices in outcome_map.items():
-                        if not prices:
-                            continue
-                        avg_price = sum(prices) / len(prices)
-                        wp = round(decimal_to_implied_prob(avg_price) * 100, 1)
-                        if wp > top_prob:
-                            top_prob = wp
-                            top_label = label
-
-                    tip = analyse_event(event)
-                    if tip:
-                        tips_found += 1
-
-                status = sport + ": " + str(count) + " games, " + str(tips_found) + " tips"
-                if count > 0:
-                    status += " | best: " + str(top_prob) + "% (" + top_label + ")"
-                lines.append(status)
+                    tips = analyse_event(event)
+                    tips_found += len(tips)
+                lines.append(sport + ": " + str(count) + " games, " + str(tips_found) + " tips")
             except Exception as e:
                 lines.append(sport + ": ERROR - " + str(e))
 
     lines.append("")
-    lines.append("Win prob range: " + str(MIN_WIN_PROB) + "% - " + str(MAX_WIN_PROB) + "%")
+    lines.append("Odds filter: " + str(MIN_ODDS) + " to " + str(MAX_ODDS))
     return "\n".join(lines)
 
 
@@ -239,7 +200,7 @@ async def get_daily_summary():
         lines = [
             "Daily Summary",
             "",
-            "No tips found today.",
+            "No tips in the " + str(MIN_ODDS) + "-" + str(MAX_ODDS) + " odds range right now.",
             "Try /diagnose to check what data is available.",
         ]
         return "\n".join(lines)
@@ -248,13 +209,13 @@ async def get_daily_summary():
     avg_odds = sum(t["odds"] for t in tips) / len(tips)
 
     lines = [
-        "Daily Summary - " + datetime.now().strftime("%d %b %Y"),
+        "Daily Summary - " + datetime.now(EST).strftime("%d %b %Y"),
         "",
         "Tips found: " + str(len(tips)),
         "Avg win probability: " + str(round(avg_prob, 1)) + "%",
         "Avg odds: " + str(round(avg_odds, 2)),
         "",
-        "Top picks today:",
+        "Current picks:",
     ]
     for i, t in enumerate(tips, 1):
         lines.append(
