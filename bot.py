@@ -24,14 +24,14 @@ if not CHANNEL_ID:
 DAILY_TIP_LIMIT = 12
 EST = timezone(timedelta(hours=-5))
 
-sent_today = {"date": "", "count": 0, "sent_ids": set(), "tips": []}
+sent_today = {"date": "", "sent_ids": set(), "tips": []}
+scheduled_tips = {}
 
 
 def reset_if_new_day():
     today = datetime.now(EST).strftime("%Y-%m-%d")
     if sent_today["date"] != today:
         sent_today["date"] = today
-        sent_today["count"] = 0
         sent_today["sent_ids"] = set()
         sent_today["tips"] = []
 
@@ -50,6 +50,7 @@ def tip_card(tip):
         "Win Probability: " + prob,
         "Confidence: [" + bar + "] " + prob,
         tip["reasoning"],
+        "KICKOFF IN 1 HOUR",
         "----------------------",
         "Gamble responsibly. 18+",
     ]
@@ -60,6 +61,82 @@ def tip_id(tip):
     return tip["match"] + "|" + tip["tip"]
 
 
+async def send_tip_job(ctx: ContextTypes.DEFAULT_TYPE):
+    tip = ctx.job.data
+    reset_if_new_day()
+    tid = tip_id(tip)
+    if tid in sent_today["sent_ids"]:
+        return
+    if len(sent_today["tips"]) >= DAILY_TIP_LIMIT:
+        return
+    try:
+        await ctx.bot.send_message(CHANNEL_ID, tip_card(tip))
+        sent_today["sent_ids"].add(tid)
+        sent_today["tips"].append(tip)
+        logger.info("Sent pre-game tip: %s", tid)
+    except Exception as e:
+        logger.error("Failed to send tip: %s", e)
+
+
+async def schedule_tips(ctx: ContextTypes.DEFAULT_TYPE):
+    reset_if_new_day()
+    try:
+        tips = await get_tips()
+    except Exception as e:
+        logger.error("Schedule scan failed: %s", e)
+        return
+
+    if not tips:
+        logger.info("Schedule scan: no tips found.")
+        return
+
+    now = datetime.now(timezone.utc)
+    scheduled_count = 0
+
+    for tip in tips:
+        tid = tip_id(tip)
+        if tid in sent_today["sent_ids"]:
+            continue
+        if tid in scheduled_tips:
+            continue
+        if len(sent_today["tips"]) + scheduled_count >= DAILY_TIP_LIMIT:
+            break
+
+        kickoff_str = tip.get("kickoff_utc")
+        if not kickoff_str:
+            continue
+
+        try:
+            kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        send_time = kickoff - timedelta(hours=1)
+
+        if send_time <= now:
+            continue
+
+        seconds_until = (send_time - now).total_seconds()
+        if seconds_until > 86400:
+            continue
+
+        ctx.job_queue.run_once(
+            send_tip_job,
+            when=seconds_until,
+            data=tip,
+            name=tid,
+        )
+        scheduled_tips[tid] = send_time
+        scheduled_count += 1
+        logger.info(
+            "Scheduled tip for %s at %s EST",
+            tid,
+            send_time.astimezone(EST).strftime("%H:%M")
+        )
+
+    logger.info("Scheduled %d new tips.", scheduled_count)
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("Today's Tips",    callback_data="tips")],
@@ -68,7 +145,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("How It Works",     callback_data="howto")],
     ]
     await update.message.reply_text(
-        "Value Bet Bot\n\nI scan for high probability betting opportunities throughout the day. Max 12 tips per day with end of day results summary.\n\nUse the buttons below:",
+        "Value Bet Bot\n\nTips are sent 1 hour before each game kicks off. Odds between 1.30 and 1.50. Max 12 tips per day.\n\nUse the buttons below:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -82,7 +159,7 @@ async def tips_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("Error fetching tips: " + str(e))
         return
     if not tips:
-        await msg.edit_text("No tips found right now. Try again later or use /diagnose.")
+        await msg.edit_text("No tips in the 1.30-1.50 range right now.")
         return
     await msg.delete()
     for tip in tips:
@@ -95,7 +172,8 @@ async def summary_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         text = "Error fetching summary: " + str(e)
     reset_if_new_day()
-    text += "\nTips sent today: " + str(sent_today["count"]) + "/" + str(DAILY_TIP_LIMIT)
+    text += "\nTips sent today: " + str(len(sent_today["tips"])) + "/" + str(DAILY_TIP_LIMIT)
+    text += "\nTips scheduled: " + str(len(scheduled_tips))
     await update.message.reply_text(text)
 
 
@@ -134,7 +212,7 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Error fetching tips: " + str(e))
             return
         if not tips:
-            await query.edit_message_text("No tips right now. Try again later.")
+            await query.edit_message_text("No tips in the 1.30-1.50 range right now.")
             return
         await query.edit_message_text("Latest tips:")
         for tip in tips:
@@ -157,45 +235,18 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif query.data == "howto":
         await query.edit_message_text(
             "How It Works\n\n"
-            "The bot scans bookmakers every 2 hours throughout the day (EST).\n"
-            "When it finds a bet with 50-70% win probability it sends it to the channel.\n"
-            "Maximum 12 tips are sent per day.\n\n"
+            "The bot scans for games every morning at 6am EST.\n"
+            "Each tip is then automatically sent to the channel exactly 1 hour before kickoff.\n"
+            "Odds filter: 1.30 to 1.50.\n"
+            "Max 12 tips per day.\n\n"
             "At 11pm EST a results summary is posted showing WIN or LOSS for each tip.\n\n"
             "Always manage your bankroll responsibly."
         )
 
 
-async def scan_and_broadcast(ctx: ContextTypes.DEFAULT_TYPE):
-    reset_if_new_day()
-    if sent_today["count"] >= DAILY_TIP_LIMIT:
-        logger.info("Daily tip limit reached. Skipping scan.")
-        return
-    try:
-        tips = await get_tips()
-    except Exception as e:
-        logger.error("Scan failed: %s", e)
-        return
-    if not tips:
-        logger.info("Scan: no tips found.")
-        return
-    for tip in tips:
-        if sent_today["count"] >= DAILY_TIP_LIMIT:
-            break
-        tid = tip_id(tip)
-        if tid in sent_today["sent_ids"]:
-            continue
-        try:
-            await ctx.bot.send_message(CHANNEL_ID, tip_card(tip))
-            sent_today["sent_ids"].add(tid)
-            sent_today["tips"].append(tip)
-            sent_today["count"] += 1
-            logger.info("Sent tip %d/%d: %s", sent_today["count"], DAILY_TIP_LIMIT, tid)
-        except Exception as e:
-            logger.error("Failed to send tip: %s", e)
-
-
 async def post_results_summary(ctx: ContextTypes.DEFAULT_TYPE):
     reset_if_new_day()
+    scheduled_tips.clear()
     if not sent_today["tips"]:
         logger.info("Results summary: no tips sent today.")
         return
@@ -213,9 +264,12 @@ async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Admin only.")
         return
-    await update.message.reply_text("Pushing tips...")
-    await scan_and_broadcast(ctx)
-    await update.message.reply_text("Done. Tips sent today: " + str(sent_today["count"]) + "/" + str(DAILY_TIP_LIMIT))
+    await update.message.reply_text("Scanning and scheduling tips...")
+    await schedule_tips(ctx)
+    await update.message.reply_text(
+        "Done. Scheduled: " + str(len(scheduled_tips)) + " tips. "
+        + "Sent today: " + str(len(sent_today["tips"])) + "/" + str(DAILY_TIP_LIMIT)
+    )
 
 
 def main():
@@ -228,33 +282,13 @@ def main():
     app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CallbackQueryHandler(button))
 
-    # Scan times EST -> UTC
-    # 02:00 EST = 07:00 UTC
-    # 04:00 EST = 09:00 UTC
-    # 06:00 EST = 11:00 UTC
-    # 08:00 EST = 13:00 UTC
-    # 10:00 EST = 15:00 UTC
-    # 12:00 EST = 17:00 UTC
-    # 14:00 EST = 19:00 UTC
-    # 18:00 EST = 23:00 UTC
-    scan_times_utc = [
-        (7,  0),
-        (9,  0),
-        (11, 0),
-        (13, 0),
-        (15, 0),
-        (17, 0),
-        (19, 0),
-        (23, 0),
-    ]
-    for h, m in scan_times_utc:
-        app.job_queue.run_daily(scan_and_broadcast, time=dtime(hour=h, minute=m))
+    # Scan for games and schedule tips at 6am EST = 11:00 UTC
+    app.job_queue.run_daily(schedule_tips, time=dtime(hour=11, minute=0))
 
-    # Results summary at 11:00 PM EST = 04:00 UTC next day
+    # Results summary at 11pm EST = 04:00 UTC
     app.job_queue.run_daily(post_results_summary, time=dtime(hour=4, minute=0))
 
-    logger.info("Bot running. Scans at 02:00 04:00 06:00 08:00 10:00 12:00 14:00 18:00 EST")
-    logger.info("Results summary at 23:00 EST")
+    logger.info("Bot running. 1 scan at 6am EST. Tips sent 1 hour before kickoff.")
     app.run_polling(drop_pending_updates=True)
 
 
