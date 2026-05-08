@@ -219,6 +219,17 @@ async def diagnose_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(report)
 
 
+async def scheduled_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    reset_if_new_day()
+    if not scheduled_tips:
+        await update.message.reply_text("No tips scheduled yet. Use /push to trigger a scan.")
+        return
+    lines = ["Scheduled Tips:", ""]
+    for tid, send_time in scheduled_tips.items():
+        lines.append(send_time.astimezone(EST).strftime("%H:%M EST") + " - " + tid)
+    await update.message.reply_text("\n".join(lines))
+
+
 async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -253,9 +264,8 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "How It Works\n\n"
             "The bot scans for games every morning at 6am EST.\n"
-            "Each tip is then automatically sent to the channel exactly 1 hour before kickoff.\n"
-            "Odds filter: 1.30 to 1.50.\n"
-            "Max 12 tips per day.\n\n"
+            "Each tip is sent to the channel exactly 1 hour before kickoff.\n"
+            "Odds filter: 1.30 to 1.50. Max 12 tips per day.\n\n"
             "At 11pm EST a results summary is posted showing WIN or LOSS for each tip.\n\n"
             "Always manage your bankroll responsibly."
         )
@@ -277,18 +287,6 @@ async def post_results_summary(ctx: ContextTypes.DEFAULT_TYPE):
         logger.error("Failed to post results summary: %s", e)
 
 
-async def scheduled_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    reset_if_new_day()
-    if not scheduled_tips:
-        await update.message.reply_text("No tips scheduled yet. Scan runs at 6am EST. Use /push to trigger manually.")
-        return
-    lines = ["Scheduled Tips:", ""]
-    for tid, send_time in scheduled_tips.items():
-        lines.append(send_time.astimezone(EST).strftime("%H:%M EST") + " - " + tid)
-    await update.message.reply_text("
-".join(lines))
-
-
 async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Admin only.")
@@ -303,16 +301,16 @@ async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",    start))
-    app.add_handler(CommandHandler("tips",     tips_command))
-    app.add_handler(CommandHandler("summary",  summary_command))
-    app.add_handler(CommandHandler("results",  results_command))
-    app.add_handler(CommandHandler("push",     push))
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("tips",      tips_command))
+    app.add_handler(CommandHandler("summary",   summary_command))
+    app.add_handler(CommandHandler("results",   results_command))
+    app.add_handler(CommandHandler("push",      push))
+    app.add_handler(CommandHandler("diagnose",  diagnose_command))
     app.add_handler(CommandHandler("scheduled", scheduled_command))
-    app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CallbackQueryHandler(button))
 
-    # Scan for games and schedule tips at 6am EST = 11:00 UTC
+    # Scan at 6am EST = 11:00 UTC
     app.job_queue.run_daily(schedule_tips, time=dtime(hour=11, minute=0))
 
     # Results summary at 11pm EST = 04:00 UTC
