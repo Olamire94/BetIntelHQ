@@ -121,16 +121,25 @@ async def schedule_tips(ctx: ContextTypes.DEFAULT_TYPE):
 
         send_time = kickoff - timedelta(hours=1)
 
-        if send_time <= now:
-            skipped_past += 1
-            logger.info("Skipping past tip: %s kickoff=%s", tid, kickoff.strftime("%H:%M UTC"))
-            continue
-
         seconds_until = (send_time - now).total_seconds()
 
         if seconds_until > 48 * 3600:
             skipped_far += 1
             logger.info("Skipping far future tip: %s", tid)
+            continue
+
+        # If kickoff already passed skip entirely
+        if kickoff <= now:
+            skipped_past += 1
+            logger.info("Skipping started game: %s", tid)
+            continue
+
+        # If send_time already passed but kickoff is still future send immediately
+        if send_time <= now:
+            ctx.job_queue.run_once(send_tip_job, when=5, data=tip, name=tid)
+            scheduled_tips[tid] = now
+            scheduled_count += 1
+            logger.info("Sending immediately (within 1hr of kickoff): %s", tid)
             continue
 
         ctx.job_queue.run_once(
