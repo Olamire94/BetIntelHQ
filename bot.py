@@ -92,6 +92,10 @@ async def schedule_tips(ctx: ContextTypes.DEFAULT_TYPE):
 
     now = datetime.now(timezone.utc)
     scheduled_count = 0
+    skipped_past = 0
+    skipped_far = 0
+
+    logger.info("Scan found %d tips. Now=%s UTC", len(tips), now.strftime("%H:%M"))
 
     for tip in tips:
         tid = tip_id(tip)
@@ -102,22 +106,31 @@ async def schedule_tips(ctx: ContextTypes.DEFAULT_TYPE):
         if len(sent_today["tips"]) + scheduled_count >= DAILY_TIP_LIMIT:
             break
 
-        kickoff_str = tip.get("kickoff_utc")
+        kickoff_str = tip.get("kickoff_utc", "")
         if not kickoff_str:
+            logger.warning("No kickoff time for tip: %s", tid)
             continue
 
         try:
             kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
-        except Exception:
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.replace(tzinfo=timezone.utc)
+        except Exception as e:
+            logger.error("Bad kickoff time %s: %s", kickoff_str, e)
             continue
 
         send_time = kickoff - timedelta(hours=1)
 
         if send_time <= now:
+            skipped_past += 1
+            logger.info("Skipping past tip: %s kickoff=%s", tid, kickoff.strftime("%H:%M UTC"))
             continue
 
         seconds_until = (send_time - now).total_seconds()
-        if seconds_until > 86400:
+
+        if seconds_until > 48 * 3600:
+            skipped_far += 1
+            logger.info("Skipping far future tip: %s", tid)
             continue
 
         ctx.job_queue.run_once(
@@ -129,12 +142,16 @@ async def schedule_tips(ctx: ContextTypes.DEFAULT_TYPE):
         scheduled_tips[tid] = send_time
         scheduled_count += 1
         logger.info(
-            "Scheduled tip for %s at %s EST",
+            "Scheduled: %s at %s EST (in %.0f mins)",
             tid,
-            send_time.astimezone(EST).strftime("%H:%M")
+            send_time.astimezone(EST).strftime("%H:%M"),
+            seconds_until / 60,
         )
 
-    logger.info("Scheduled %d new tips.", scheduled_count)
+    logger.info(
+        "Scheduling done. Scheduled=%d, past=%d, far=%d",
+        scheduled_count, skipped_past, skipped_far
+    )
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -260,6 +277,18 @@ async def post_results_summary(ctx: ContextTypes.DEFAULT_TYPE):
         logger.error("Failed to post results summary: %s", e)
 
 
+async def scheduled_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    reset_if_new_day()
+    if not scheduled_tips:
+        await update.message.reply_text("No tips scheduled yet. Scan runs at 6am EST. Use /push to trigger manually.")
+        return
+    lines = ["Scheduled Tips:", ""]
+    for tid, send_time in scheduled_tips.items():
+        lines.append(send_time.astimezone(EST).strftime("%H:%M EST") + " - " + tid)
+    await update.message.reply_text("
+".join(lines))
+
+
 async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Admin only.")
@@ -279,6 +308,7 @@ def main():
     app.add_handler(CommandHandler("summary",  summary_command))
     app.add_handler(CommandHandler("results",  results_command))
     app.add_handler(CommandHandler("push",     push))
+    app.add_handler(CommandHandler("scheduled", scheduled_command))
     app.add_handler(CommandHandler("diagnose", diagnose_command))
     app.add_handler(CallbackQueryHandler(button))
 
