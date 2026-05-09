@@ -2,11 +2,8 @@ import os
 import logging
 from datetime import datetime, time as dtime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-Application, CommandHandler, CallbackQueryHandler,
-ContextTypes,
-)
-from tips_engine import get_tips, get_daily_summary, run_diagnostic
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from tips_engine import get_best_tip, get_daily_summary, run_diagnostic
 from results_engine import get_results, build_results_summary
 
 logging.basicConfig(format=”%(asctime)s | %(levelname)s | %(message)s”, level=logging.INFO)
@@ -21,25 +18,28 @@ raise RuntimeError(“BOT_TOKEN environment variable is not set.”)
 if not CHANNEL_ID:
 raise RuntimeError(“CHANNEL_ID environment variable is not set.”)
 
-DAILY_TIP_LIMIT = 12
 EST = timezone(timedelta(hours=-5))
 
-sent_today = {“date”: “”, “sent_ids”: set(), “tips”: []}
-scheduled_tips = {}
+sent_today = {“date”: “”, “tip_sent”: False, “tip”: None, “sent_id”: “”}
+scheduled_tip = {}
 
 def reset_if_new_day():
 today = datetime.now(EST).strftime(”%Y-%m-%d”)
 if sent_today[“date”] != today:
 sent_today[“date”] = today
-sent_today[“sent_ids”] = set()
-sent_today[“tips”] = []
+sent_today[“tip_sent”] = False
+sent_today[“tip”] = None
+sent_today[“sent_id”] = “”
+scheduled_tip.clear()
 
 def tip_card(tip):
 prob = str(tip.get(“win_prob”, “?”)) + “%”
 bar_filled = int(tip.get(“win_prob”, 0) / 10)
 bar = “#” * bar_filled + “-” * (10 - bar_filled)
-lines = [
-“–––––––––––”,
+return “\n”.join([
+“======================”,
+“TIP OF THE DAY”,
+“======================”,
 tip[“match”],
 tip[“date”] + “ | “ + tip[“league”],
 “–––––––––––”,
@@ -51,164 +51,117 @@ tip[“reasoning”],
 “KICKOFF IN 1 HOUR”,
 “–––––––––––”,
 “Gamble responsibly. 18+”,
-]
-return “\n”.join(lines)
+])
 
 def tip_id(tip):
 return tip[“match”] + “|” + tip[“tip”]
 
 async def send_tip_job(ctx: ContextTypes.DEFAULT_TYPE):
-tip = ctx.job.data
 reset_if_new_day()
-tid = tip_id(tip)
-if tid in sent_today[“sent_ids”]:
+tip = ctx.job.data
+if sent_today[“tip_sent”]:
 return
-if len(sent_today[“tips”]) >= DAILY_TIP_LIMIT:
+tid = tip_id(tip)
+if sent_today[“sent_id”] == tid:
 return
 try:
 await ctx.bot.send_message(CHANNEL_ID, tip_card(tip))
-sent_today[“sent_ids”].add(tid)
-sent_today[“tips”].append(tip)
-logger.info(“Sent pre-game tip: %s”, tid)
+sent_today[“tip_sent”] = True
+sent_today[“tip”] = tip
+sent_today[“sent_id”] = tid
+logger.info(“Tip sent: %s”, tid)
 except Exception as e:
 logger.error(“Failed to send tip: %s”, e)
 
-async def schedule_tips(ctx: ContextTypes.DEFAULT_TYPE):
+async def daily_scan(ctx: ContextTypes.DEFAULT_TYPE):
 reset_if_new_day()
-try:
-tips = await get_tips()
-except Exception as e:
-logger.error(“Schedule scan failed: %s”, e)
+if sent_today[“tip_sent”]:
+logger.info(“Tip already sent today.”)
 return
-
-```
-if not tips:
-    logger.info("Schedule scan: no tips found.")
-    return
-
+try:
+tip = await get_best_tip()
+except Exception as e:
+logger.error(“Scan failed: %s”, e)
+return
+if not tip:
+logger.info(“Scan: no qualifying tip found.”)
+return
+tid = tip_id(tip)
 now = datetime.now(timezone.utc)
-scheduled_count = 0
-skipped_past = 0
-skipped_far = 0
-
-logger.info("Scan found %d tips. Now=%s UTC", len(tips), now.strftime("%H:%M"))
-
-for tip in tips:
-    tid = tip_id(tip)
-    if tid in sent_today["sent_ids"]:
-        continue
-    if tid in scheduled_tips:
-        continue
-    if len(sent_today["tips"]) + scheduled_count >= DAILY_TIP_LIMIT:
-        break
-
-    kickoff_str = tip.get("kickoff_utc", "")
-    if not kickoff_str:
-        logger.warning("No kickoff time for tip: %s", tid)
-        continue
-
-    try:
-        kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
-        if kickoff.tzinfo is None:
-            kickoff = kickoff.replace(tzinfo=timezone.utc)
-    except Exception as e:
-        logger.error("Bad kickoff time %s: %s", kickoff_str, e)
-        continue
-
-    send_time = kickoff - timedelta(hours=1)
-
-    seconds_until = (send_time - now).total_seconds()
-
-    if seconds_until > 48 * 3600:
-        skipped_far += 1
-        logger.info("Skipping far future tip: %s", tid)
-        continue
-
-    # If kickoff already passed skip entirely
-    if kickoff <= now:
-        skipped_past += 1
-        logger.info("Skipping started game: %s", tid)
-        continue
-
-    # If send_time already passed but kickoff is still future send immediately
-    if send_time <= now:
-        ctx.job_queue.run_once(send_tip_job, when=5, data=tip, name=tid)
-        scheduled_tips[tid] = now
-        scheduled_count += 1
-        logger.info("Sending immediately (within 1hr of kickoff): %s", tid)
-        continue
-
-    ctx.job_queue.run_once(
-        send_tip_job,
-        when=seconds_until,
-        data=tip,
-        name=tid,
-    )
-    scheduled_tips[tid] = send_time
-    scheduled_count += 1
-    logger.info(
-        "Scheduled: %s at %s EST (in %.0f mins)",
-        tid,
-        send_time.astimezone(EST).strftime("%H:%M"),
-        seconds_until / 60,
-    )
-
-logger.info(
-    "Scheduling done. Scheduled=%d, past=%d, far=%d",
-    scheduled_count, skipped_past, skipped_far
-)
-```
+kickoff = None
+try:
+ks = tip.get(“kickoff_utc”, “”)
+kickoff = datetime.fromisoformat(ks.replace(“Z”, “+00:00”))
+if kickoff.tzinfo is None:
+kickoff = kickoff.replace(tzinfo=timezone.utc)
+except Exception:
+pass
+if kickoff and kickoff > now:
+send_time = kickoff - timedelta(hours=1)
+if send_time <= now:
+ctx.job_queue.run_once(send_tip_job, when=5, data=tip, name=tid)
+logger.info(“Tip firing immediately (within 1hr of kickoff): %s”, tid)
+else:
+secs = (send_time - now).total_seconds()
+ctx.job_queue.run_once(send_tip_job, when=secs, data=tip, name=tid)
+scheduled_tip[“tip”] = tip
+scheduled_tip[“send_time”] = send_time
+logger.info(“Tip scheduled at %s EST”, send_time.astimezone(EST).strftime(”%H:%M”))
+else:
+ctx.job_queue.run_once(send_tip_job, when=5, data=tip, name=tid)
+logger.info(“Tip firing immediately (no kickoff time): %s”, tid)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 kb = [
-[InlineKeyboardButton(“Today’s Tips”,    callback_data=“tips”)],
+[InlineKeyboardButton(“Today’s Tip”,     callback_data=“tips”)],
 [InlineKeyboardButton(“Daily Summary”,    callback_data=“summary”)],
 [InlineKeyboardButton(“Today’s Results”,  callback_data=“results”)],
 [InlineKeyboardButton(“How It Works”,     callback_data=“howto”)],
 ]
 await update.message.reply_text(
-“Value Bet Bot\n\nTips are sent 1 hour before each game kicks off. Odds between 1.30 and 1.50. Max 12 tips per day.\n\nUse the buttons below:”,
+“Value Bet Bot\n\n1 tip per day.\nScans at 6am EST for the best odds between 1.30 and 1.50 across all sports.\nTip is sent 1 hour before kickoff.\nResults summary at 11pm EST.”,
 reply_markup=InlineKeyboardMarkup(kb),
 )
 
 async def tips_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-msg = await update.message.reply_text(“Fetching tips…”)
+msg = await update.message.reply_text(“Fetching best tip…”)
 try:
-tips = await get_tips()
+tip = await get_best_tip()
 except Exception as e:
-logger.error(“get_tips failed: %s”, e)
-await msg.edit_text(“Error fetching tips: “ + str(e))
+await msg.edit_text(“Error: “ + str(e))
 return
-if not tips:
+if not tip:
 await msg.edit_text(“No tips in the 1.30-1.50 range right now.”)
 return
 await msg.delete()
-for tip in tips:
 await update.message.reply_text(tip_card(tip))
 
 async def summary_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 try:
 text = await get_daily_summary()
 except Exception as e:
-text = “Error fetching summary: “ + str(e)
+text = “Error: “ + str(e)
 reset_if_new_day()
-text += “\nTips sent today: “ + str(len(sent_today[“tips”])) + “/” + str(DAILY_TIP_LIMIT)
-text += “\nTips scheduled: “ + str(len(scheduled_tips))
+if scheduled_tip.get(“send_time”):
+text += “\nScheduled for: “ + scheduled_tip[“send_time”].astimezone(EST).strftime(”%H:%M EST”)
+elif sent_today[“tip_sent”]:
+text += “\nTip sent today.”
+else:
+text += “\nNo tip scheduled yet. Scan runs at 6am EST.”
 await update.message.reply_text(text)
 
 async def results_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 msg = await update.message.reply_text(“Checking results…”)
 reset_if_new_day()
-if not sent_today[“tips”]:
-await msg.edit_text(“No tips have been sent today yet.”)
+if not sent_today[“tip”]:
+await msg.edit_text(“No tip sent today yet.”)
 return
 try:
-tip_results = await get_results(sent_today[“tips”])
-date_str = datetime.now(EST).strftime(”%d %b %Y”)
-summary = build_results_summary(tip_results, date_str)
+tip_results = await get_results([sent_today[“tip”]])
+summary = build_results_summary(tip_results, datetime.now(EST).strftime(”%d %b %Y”))
 await msg.edit_text(summary)
 except Exception as e:
-await msg.edit_text(“Error fetching results: “ + str(e))
+await msg.edit_text(“Error: “ + str(e))
 
 async def diagnose_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 msg = await update.message.reply_text(“Running diagnostics…”)
@@ -219,101 +172,88 @@ await msg.edit_text(“Diagnostic error: “ + str(e))
 return
 await msg.edit_text(report)
 
-async def scheduled_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-reset_if_new_day()
-if not scheduled_tips:
-await update.message.reply_text(“No tips scheduled yet. Use /push to trigger a scan.”)
-return
-lines = [“Scheduled Tips:”, “”]
-for tid, send_time in scheduled_tips.items():
-lines.append(send_time.astimezone(EST).strftime(”%H:%M EST”) + “ - “ + tid)
-await update.message.reply_text(”\n”.join(lines))
-
 async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 query = update.callback_query
 await query.answer()
 if query.data == “tips”:
 try:
-tips = await get_tips()
+tip = await get_best_tip()
 except Exception as e:
-await query.edit_message_text(“Error fetching tips: “ + str(e))
+await query.edit_message_text(“Error: “ + str(e))
 return
-if not tips:
+if not tip:
 await query.edit_message_text(“No tips in the 1.30-1.50 range right now.”)
 return
-await query.edit_message_text(“Latest tips:”)
-for tip in tips:
-await query.message.reply_text(tip_card(tip))
+await query.edit_message_text(tip_card(tip))
 elif query.data == “summary”:
-text = await get_daily_summary()
-await query.edit_message_text(text)
+await query.edit_message_text(await get_daily_summary())
 elif query.data == “results”:
 reset_if_new_day()
-if not sent_today[“tips”]:
-await query.edit_message_text(“No tips have been sent today yet.”)
+if not sent_today[“tip”]:
+await query.edit_message_text(“No tip sent today yet.”)
 return
 try:
-tip_results = await get_results(sent_today[“tips”])
-date_str = datetime.now(EST).strftime(”%d %b %Y”)
-summary = build_results_summary(tip_results, date_str)
+tip_results = await get_results([sent_today[“tip”]])
+summary = build_results_summary(tip_results, datetime.now(EST).strftime(”%d %b %Y”))
 await query.edit_message_text(summary)
 except Exception as e:
-await query.edit_message_text(“Error fetching results: “ + str(e))
+await query.edit_message_text(“Error: “ + str(e))
 elif query.data == “howto”:
 await query.edit_message_text(
 “How It Works\n\n”
-“The bot scans for games every morning at 6am EST.\n”
-“Each tip is sent to the channel exactly 1 hour before kickoff.\n”
-“Odds filter: 1.30 to 1.50. Max 12 tips per day.\n\n”
-“At 11pm EST a results summary is posted showing WIN or LOSS for each tip.\n\n”
-“Always manage your bankroll responsibly.”
+“Every day at 6am EST the bot scans all sports for the single best tip with odds between 1.30 and 1.50.\n\n”
+“The tip is sent to the channel exactly 1 hour before kickoff.\n\n”
+“At 11pm EST a results summary is posted showing WIN or LOSS.\n\n”
+“1 scan per day keeps usage within the free API tier.\n\n”
+“Gamble responsibly.”
 )
 
 async def post_results_summary(ctx: ContextTypes.DEFAULT_TYPE):
 reset_if_new_day()
-scheduled_tips.clear()
-if not sent_today[“tips”]:
-logger.info(“Results summary: no tips sent today.”)
+scheduled_tip.clear()
+if not sent_today[“tip”]:
+logger.info(“Results: no tip sent today.”)
 return
 try:
-tip_results = await get_results(sent_today[“tips”])
-date_str = datetime.now(EST).strftime(”%d %b %Y”)
-summary = build_results_summary(tip_results, date_str)
+tip_results = await get_results([sent_today[“tip”]])
+summary = build_results_summary(tip_results, datetime.now(EST).strftime(”%d %b %Y”))
 await ctx.bot.send_message(CHANNEL_ID, summary)
-logger.info(“Results summary posted.”)
+logger.info(“Results posted.”)
 except Exception as e:
-logger.error(“Failed to post results summary: %s”, e)
+logger.error(“Results failed: %s”, e)
 
 async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 if update.effective_user.id != ADMIN_ID:
 await update.message.reply_text(“Admin only.”)
 return
-await update.message.reply_text(“Scanning and scheduling tips…”)
-await schedule_tips(ctx)
-await update.message.reply_text(
-“Done. Scheduled: “ + str(len(scheduled_tips)) + “ tips. “
-+ “Sent today: “ + str(len(sent_today[“tips”])) + “/” + str(DAILY_TIP_LIMIT)
-)
+await update.message.reply_text(“Triggering daily scan…”)
+await daily_scan(ctx)
+if scheduled_tip.get(“send_time”):
+t = scheduled_tip[“send_time”].astimezone(EST).strftime(”%H:%M EST”)
+await update.message.reply_text(“Done. Tip scheduled for “ + t)
+elif sent_today[“tip_sent”]:
+await update.message.reply_text(“Done. Tip sent to channel.”)
+else:
+await update.message.reply_text(“Done. No qualifying tip found right now.”)
 
 def main():
 app = Application.builder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler(“start”,     start))
-app.add_handler(CommandHandler(“tips”,      tips_command))
-app.add_handler(CommandHandler(“summary”,   summary_command))
-app.add_handler(CommandHandler(“results”,   results_command))
-app.add_handler(CommandHandler(“push”,      push))
-app.add_handler(CommandHandler(“diagnose”,  diagnose_command))
-app.add_handler(CommandHandler(“scheduled”, scheduled_command))
+app.add_handler(CommandHandler(“start”,    start))
+app.add_handler(CommandHandler(“tips”,     tips_command))
+app.add_handler(CommandHandler(“summary”,  summary_command))
+app.add_handler(CommandHandler(“results”,  results_command))
+app.add_handler(CommandHandler(“push”,     push))
+app.add_handler(CommandHandler(“diagnose”, diagnose_command))
 app.add_handler(CallbackQueryHandler(button))
 
 ```
-# Scan at 6am EST = 11:00 UTC
-app.job_queue.run_daily(schedule_tips, time=dtime(hour=11, minute=0))
+# Daily scan at 6am EST = 11:00 UTC
+app.job_queue.run_daily(daily_scan, time=dtime(hour=11, minute=0))
 
 # Results summary at 11pm EST = 04:00 UTC
 app.job_queue.run_daily(post_results_summary, time=dtime(hour=4, minute=0))
 
-logger.info("Bot running. 1 scan at 6am EST. Tips sent 1 hour before kickoff.")
+logger.info("Bot running. 1 scan at 6am EST. Tip sent 1 hour before kickoff.")
 app.run_polling(drop_pending_updates=True)
 ```
 
