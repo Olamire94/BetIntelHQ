@@ -6,7 +6,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from tips_engine import get_best_tip, get_daily_summary, run_diagnostic
 from results_engine import get_results, build_results_summary
 
-logging.basicConfig(format=’%(asctime)s | %(levelname)s | %(message)s’, level=logging.INFO)
+LOG_FORMAT = chr(37) + chr(40) + chr(97) + chr(115) + chr(99) + chr(116) + chr(105) + chr(109) + chr(101) + chr(41) + chr(115) + chr(32) + chr(124) + chr(32) + chr(37) + chr(40) + chr(108) + chr(101) + chr(118) + chr(101) + chr(108) + chr(110) + chr(97) + chr(109) + chr(101) + chr(41) + chr(115) + chr(32) + chr(124) + chr(32) + chr(37) + chr(40) + chr(109) + chr(101) + chr(115) + chr(115) + chr(97) + chr(103) + chr(101) + chr(41) + chr(115)
+logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
 logger = logging.getLogger(**name**)
 
 BOT_TOKEN  = os.environ.get(‘BOT_TOKEN’, ‘’).strip()
