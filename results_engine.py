@@ -16,16 +16,6 @@ SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
-    "soccer_france_ligue_one",
-    "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga",
-    "soccer_turkey_super_league",
-    "soccer_brazil_campeonato",
-    "soccer_argentina_primera_division",
-    "soccer_mexico_ligamx",
-    "soccer_usa_mls",
-    "soccer_uefa_europa_league",
-    "soccer_england_efl_champ",
     "soccer_australia_aleague",
     "soccer_japan_j_league",
     "basketball_nba",
@@ -33,187 +23,137 @@ SPORTS = [
     "baseball_mlb",
 ]
 
+SOCCER_SPORTS = [
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_germany_bundesliga",
+    "soccer_italy_serie_a",
+    "soccer_uefa_champs_league",
+    "soccer_australia_aleague",
+    "soccer_japan_j_league",
+]
 
-async def fetch_scores(sport, session):
+MIN_ODDS = 1.30
+MAX_ODDS = 1.50
+MAX_TIPS_PER_RUN = 10
+
+
+def decimal_to_implied_prob(odds):
+    return 1.0 / odds if odds > 0 else 0.0
+
+
+def value_edge(fair_prob, decimal_odds):
+    return (fair_prob * decimal_odds - 1) * 100
+
+
+async def fetch_odds(sport, session):
+    is_soccer = sport in SOCCER_SPORTS
+    markets = "h2h,totals,spreads"
+    if is_soccer:
+        markets = "h2h,totals,btts,spreads"
+
     url = (
-        ODDS_API_BASE + "/sports/" + sport + "/scores"
+        ODDS_API_BASE + "/sports/" + sport + "/odds"
         + "?apiKey=" + ODDS_API_KEY
-        + "&daysFrom=1"
+        + "&regions=uk,eu"
+        + "&markets=" + markets
+        + "&oddsFormat=decimal"
         + "&dateFormat=iso"
     )
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
-                return await resp.json()
-            logger.warning("Scores API %s returned %d", sport, resp.status)
+                data = await resp.json()
+                return data, sport
+            logger.warning("Odds API %s returned %d", sport, resp.status)
+            return [], sport
     except Exception as exc:
-        logger.error("fetch_scores error (%s): %s", sport, exc)
-    return []
+        logger.error("fetch_odds error (%s): %s", sport, exc)
+    return [], sport
 
 
-def get_score(game):
-    scores = game.get("scores")
-    if not scores:
-        return None, None
-    result = {}
-    for s in scores:
-        result[s["name"]] = s.get("score", "?")
-    return result
+def fmt_date(iso):
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone(EST).strftime("%d %b %Y %H:%M EST")
+    except Exception:
+        return iso
 
 
-def did_tip_win(tip, game):
-    tip_text = tip["tip"].lower()
-    home = game["home_team"]
-    away = game["away_team"]
-    scores = game.get("scores")
+def get_all_outcomes(bookmakers):
+    outcome_map = {}
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            mkey = market.get("key")
+            for o in market.get("outcomes", []):
+                name = o["name"]
+                price = o["price"]
+                point = o.get("point", None)
 
-    if not scores:
-        return None
+                if mkey == "totals":
+                    label = name + " " + str(point) + " goals/runs"
+                elif mkey == "btts":
+                    label = "BTTS " + name
+                elif mkey == "spreads":
+                    sign = "+" if point and point > 0 else ""
+                    label = name + " handicap " + sign + str(point)
+                else:
+                    label = name + " to win"
 
-    score_map = {}
-    for s in scores:
-        try:
-            score_map[s["name"]] = float(s.get("score", 0))
-        except Exception:
-            score_map[s["name"]] = 0.0
-
-    home_score = score_map.get(home, 0)
-    away_score = score_map.get(away, 0)
-    total = home_score + away_score
-
-    if "to win" in tip_text:
-        team = tip_text.replace(" to win", "").strip()
-        if team.lower() == home.lower():
-            return home_score > away_score
-        elif team.lower() == away.lower():
-            return away_score > home_score
-        else:
-            return None
-
-    if "draw" in tip_text:
-        return home_score == away_score
-
-    if "over" in tip_text:
-        try:
-            line = float(tip_text.split("over")[1].split("goals")[0].split("runs")[0].strip())
-            return total > line
-        except Exception:
-            return None
-
-    if "under" in tip_text:
-        try:
-            line = float(tip_text.split("under")[1].split("goals")[0].split("runs")[0].strip())
-            return total < line
-        except Exception:
-            return None
-
-    if "btts yes" in tip_text:
-        return home_score > 0 and away_score > 0
-
-    if "btts no" in tip_text:
-        return home_score == 0 or away_score == 0
-
-    if "handicap" in tip_text:
-        try:
-            parts = tip_text.split("handicap")
-            team = parts[0].strip()
-            line = float(parts[1].strip().split(" ")[0])
-            if team.lower() == home.lower():
-                return (home_score + line) > away_score
-            elif team.lower() == away.lower():
-                return (away_score + line) > home_score
-        except Exception:
-            return None
-
-    return None
+                if label not in outcome_map:
+                    outcome_map[label] = []
+                outcome_map[label].append(price)
+    return outcome_map
 
 
-async def get_results(sent_tips):
-    if not sent_tips:
+def analyse_event(event):
+    bookmakers = event.get("bookmakers", [])
+    if not bookmakers:
         return []
 
-    all_scores = []
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_scores(sport, session) for sport in SPORTS]
-        results = await asyncio.gather(*tasks)
-    for games in results:
-        all_scores.extend(games)
+    home = event["home_team"]
+    away = event["away_team"]
+    outcome_map = get_all_outcomes(bookmakers)
 
-    completed = [g for g in all_scores if g.get("completed") is True]
+    if not outcome_map:
+        return []
 
-    tip_results = []
-    for tip in sent_tips:
-        matched_game = None
-        tip_match = tip["match"].lower()
-        for game in completed:
-            game_match = (game["home_team"] + " vs " + game["away_team"]).lower()
-            if (game["home_team"].lower() in tip_match and
-                    game["away_team"].lower() in tip_match):
-                matched_game = game
-                break
-
-        if not matched_game:
-            tip_results.append({
-                "tip":    tip,
-                "result": "pending",
-                "score":  "N/A",
-            })
+    tips = []
+    for label, prices in outcome_map.items():
+        if not prices:
             continue
 
-        score_map = {}
-        for s in matched_game.get("scores") or []:
-            score_map[s["name"]] = s.get("score", "?")
+        best_price = max(prices)
+        avg_price = sum(prices) / len(prices)
 
-        home = matched_game["home_team"]
-        away = matched_game["away_team"]
-        score_str = (
-            home + " " + str(score_map.get(home, "?"))
-            + " - " + str(score_map.get(away, "?"))
-            + " " + away
+        if best_price < MIN_ODDS or best_price > MAX_ODDS:
+            continue
+
+        win_prob = round(decimal_to_implied_prob(avg_price) * 100, 1)
+        implied_at_best = round(decimal_to_implied_prob(best_price) * 100, 1)
+
+        reasoning = (
+            "Market consensus probability: " + str(win_prob) + "%."
+            + " Best odds imply: " + str(implied_at_best) + "%."
         )
 
-        won = did_tip_win(tip, matched_game)
-        if won is True:
-            result = "WIN"
-        elif won is False:
-            result = "LOSS"
-        else:
-            result = "pending"
-
-        tip_results.append({
-            "tip":    tip,
-            "result": result,
-            "score":  score_str,
+        tips.append({
+            "match":      home + " vs " + away,
+            "league":     event.get("sport_title", ""),
+            "date":       fmt_date(event.get("commence_time", "")),
+            "tip":        label,
+            "odds":       round(best_price, 2),
+            "win_prob":   win_prob,
+            "confidence": min(5, max(1, int(win_prob / 20))),
+            "reasoning":  reasoning,
         })
 
-    return tip_results
+    tips.sort(key=lambda t: t["win_prob"], reverse=True)
+    return tips[:1]
 
 
-def build_results_summary(tip_results, date_str):
-    wins   = [r for r in tip_results if r["result"] == "WIN"]
-    losses = [r for r in tip_results if r["result"] == "LOSS"]
-    pending = [r for r in tip_results if r["result"] == "pending"]
-
-    lines = [
-        "Results Summary - " + date_str,
-        "",
-        "Record: " + str(len(wins)) + "W / " + str(len(losses)) + "L / " + str(len(pending)) + " pending",
-        "",
-    ]
-
-    for r in tip_results:
-        tip = r["tip"]
-        icon = "WIN" if r["result"] == "WIN" else ("LOSS" if r["result"] == "LOSS" else "PENDING")
-        lines.append(icon + " | " + tip["match"])
-        lines.append("     Tip: " + tip["tip"] + " @ " + str(tip["odds"]))
-        lines.append("     Score: " + r["score"])
-        lines.append("")
-
-    lines.append("Gamble responsibly.")
-    return "\n".join(lines)
-async def get_best_tip(window_start=0, window_end=24):
+async def get_tips():
     all_tips = []
-    EST_ZONE = timezone(timedelta(hours=-5))
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_odds(sport, session) for sport in SPORTS]
         results = await asyncio.gather(*tasks)
@@ -221,16 +161,67 @@ async def get_best_tip(window_start=0, window_end=24):
         events, sport = result
         for event in events:
             tips = analyse_event(event)
-            if not tips:
-                continue
-            kickoff_str = event.get("commence_time", "")
-            try:
-                kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
-                hour = kickoff.astimezone(EST_ZONE).hour
-                if hour < window_start or hour >= window_end:
-                    continue
-            except Exception:
-                pass
             all_tips.extend(tips)
     all_tips.sort(key=lambda t: t["win_prob"], reverse=True)
-    return all_tips[0] if all_tips else None
+    return all_tips[:MAX_TIPS_PER_RUN]
+
+
+async def run_diagnostic():
+    lines = ["Diagnostic Report", ""]
+    if not ODDS_API_KEY:
+        lines.append("ERROR: ODDS_API_KEY is not set.")
+        return "\n".join(lines)
+
+    lines.append("API Key: set (" + ODDS_API_KEY[:6] + "...)")
+    lines.append("Odds range: " + str(MIN_ODDS) + " - " + str(MAX_ODDS))
+    lines.append("")
+
+    async with aiohttp.ClientSession() as session:
+        for sport in SPORTS:
+            try:
+                events, _ = await fetch_odds(sport, session)
+                count = len(events)
+                tips_found = 0
+                for event in events:
+                    tips = analyse_event(event)
+                    tips_found += len(tips)
+                lines.append(sport + ": " + str(count) + " games, " + str(tips_found) + " tips")
+            except Exception as e:
+                lines.append(sport + ": ERROR - " + str(e))
+
+    lines.append("")
+    lines.append("Odds filter: " + str(MIN_ODDS) + " to " + str(MAX_ODDS))
+    return "\n".join(lines)
+
+
+async def get_daily_summary():
+    tips = await get_tips()
+    if not tips:
+        lines = [
+            "Daily Summary",
+            "",
+            "No tips in the " + str(MIN_ODDS) + "-" + str(MAX_ODDS) + " odds range right now.",
+            "Try /diagnose to check what data is available.",
+        ]
+        return "\n".join(lines)
+
+    avg_prob = sum(t["win_prob"] for t in tips) / len(tips)
+    avg_odds = sum(t["odds"] for t in tips) / len(tips)
+
+    lines = [
+        "Daily Summary - " + datetime.now(EST).strftime("%d %b %Y"),
+        "",
+        "Tips found: " + str(len(tips)),
+        "Avg win probability: " + str(round(avg_prob, 1)) + "%",
+        "Avg odds: " + str(round(avg_odds, 2)),
+        "",
+        "Current picks:",
+    ]
+    for i, t in enumerate(tips, 1):
+        lines.append(
+            str(i) + ". " + t["match"] + " - " + t["tip"]
+            + " @ " + str(t["odds"]) + " (" + str(t["win_prob"]) + "% win prob)"
+        )
+    lines.append("")
+    lines.append("Gamble responsibly.")
+    return "\n".join(lines)
