@@ -211,3 +211,26 @@ def build_results_summary(tip_results, date_str):
 
     lines.append("Gamble responsibly.")
     return "\n".join(lines)
+async def get_best_tip(window_start=0, window_end=24):
+    all_tips = []
+    EST_ZONE = timezone(timedelta(hours=-5))
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_odds(sport, session) for sport in SPORTS]
+        results = await asyncio.gather(*tasks)
+    for result in results:
+        events, sport = result
+        for event in events:
+            tips = analyse_event(event)
+            if not tips:
+                continue
+            kickoff_str = event.get("commence_time", "")
+            try:
+                kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+                hour = kickoff.astimezone(EST_ZONE).hour
+                if hour < window_start or hour >= window_end:
+                    continue
+            except Exception:
+                pass
+            all_tips.extend(tips)
+    all_tips.sort(key=lambda t: t["win_prob"], reverse=True)
+    return all_tips[0] if all_tips else None
