@@ -224,7 +224,7 @@ async def job_results_summary() -> None:
 # Scheduler
 # ---------------------------------------------------------------------------
 
-def build_scheduler(app) -> AsyncIOScheduler:
+def build_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=ATL)
 
     scheduler.add_job(
@@ -245,15 +245,22 @@ def build_scheduler(app) -> AsyncIOScheduler:
 
     return scheduler
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+
+async def post_init(app) -> None:
+    """Called by python-telegram-bot after the event loop is running."""
+    scheduler = build_scheduler()
+    scheduler.start()
+    app.bot_data["scheduler"] = scheduler
+    logger.info("BetIntelHQ live — next scan at 06:00 AT (Halifax)")
+
 
 def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    scheduler = build_scheduler(app)
-    scheduler.start()
-    logger.info("BetIntelHQ live — next scan at 06:00 AT (Halifax)")
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     app.run_polling(drop_pending_updates=True)
 
 
