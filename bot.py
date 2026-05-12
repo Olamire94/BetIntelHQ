@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 # Config  (set as Railway environment variables)
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
-CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
+BOT_TOKEN  = os.environ["BOT_TOKEN"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]
 ATL        = ZoneInfo("America/Halifax")
 
 # ---------------------------------------------------------------------------
