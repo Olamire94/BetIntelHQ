@@ -1,257 +1,261 @@
+"""
+bot.py — BetIntelHQ Telegram Bot
+
+Schedule (all Atlantic / Halifax time):
+  06:00 AT → daily scan (10 API calls), store best tip
+  KO - 1h  → send tip to channel
+  23:00 AT → post daily results summary
+"""
+
 import os
 import logging
-from datetime import datetime, time as dtime, timezone, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from tips_engine import get_best_tip, get_daily_summary, run_diagnostic
-from results_engine import get_results, build_results_summary
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-LOG_FORMAT = chr(37) + chr(40) + chr(97) + chr(115) + chr(99) + chr(116) + chr(105) + chr(109) + chr(101) + chr(41) + chr(115) + chr(32) + chr(124) + chr(32) + chr(37) + chr(40) + chr(108) + chr(101) + chr(118) + chr(101) + chr(108) + chr(110) + chr(97) + chr(109) + chr(101) + chr(41) + chr(115) + chr(32) + chr(124) + chr(32) + chr(37) + chr(40) + chr(109) + chr(101) + chr(115) + chr(115) + chr(97) + chr(103) + chr(101) + chr(41) + chr(115)
-logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
-logger = logging.getLogger(**name**)
+from telegram import Bot
+from telegram.ext import ApplicationBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-BOT_TOKEN  = os.environ.get(‘BOT_TOKEN’, ‘’).strip()
-CHANNEL_ID = os.environ.get(‘CHANNEL_ID’, ‘’).strip()
-ADMIN_ID   = int(os.environ.get(‘ADMIN_ID’, ‘0’).strip())
+from tips_engine import get_best_tip
 
-if not BOT_TOKEN:
-raise RuntimeError(‘BOT_TOKEN environment variable is not set.’)
-if not CHANNEL_ID:
-raise RuntimeError(‘CHANNEL_ID environment variable is not set.’)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-EST = timezone(timedelta(hours=-5))
-
-sent_today = {‘date’: ‘’, ‘tip_sent’: False, ‘tip’: None, ‘sent_id’: ‘’}
-scheduled_tip = {}
-
-def reset_if_new_day():
-today = datetime.now(EST).strftime(’%Y-%m-%d’)
-if sent_today[‘date’] != today:
-sent_today[‘date’] = today
-sent_today[‘tip_sent’] = False
-sent_today[‘tip’] = None
-sent_today[‘sent_id’] = ‘’
-scheduled_tip.clear()
-
-def tip_card(tip):
-prob = str(tip.get(‘win_prob’, ‘?’)) + ‘%’
-bar_filled = int(tip.get(‘win_prob’, 0) / 10)
-bar = ‘#’ * bar_filled + ‘-’ * (10 - bar_filled)
-return ‘\n’.join([
-‘======================’,
-‘TIP OF THE DAY’,
-‘======================’,
-tip[‘match’],
-tip[‘date’] + ’ | ’ + tip[‘league’],
-‘–––––––––––’,
-’Tip: ’ + tip[‘tip’],
-’Odds: ’ + str(tip[‘odds’]),
-’Win Probability: ’ + prob,
-‘Confidence: [’ + bar + ’] ’ + prob,
-tip[‘reasoning’],
-‘KICKOFF IN 1 HOUR’,
-‘–––––––––––’,
-‘Gamble responsibly. 18+’,
-])
-
-def tip_id(tip):
-return tip[‘match’] + ‘|’ + tip[‘tip’]
-
-async def send_tip_job(ctx: ContextTypes.DEFAULT_TYPE):
-reset_if_new_day()
-tip = ctx.job.data
-if sent_today[‘tip_sent’]:
-return
-tid = tip_id(tip)
-if sent_today[‘sent_id’] == tid:
-return
-try:
-await ctx.bot.send_message(CHANNEL_ID, tip_card(tip))
-sent_today[‘tip_sent’] = True
-sent_today[‘tip’] = tip
-sent_today[‘sent_id’] = tid
-logger.info(‘Tip sent: %s’, tid)
-except Exception as e:
-logger.error(‘Failed to send tip: %s’, e)
-
-async def daily_scan(ctx: ContextTypes.DEFAULT_TYPE):
-reset_if_new_day()
-if sent_today[‘tip_sent’]:
-logger.info(‘Tip already sent today.’)
-return
-try:
-tip = await get_best_tip()
-except Exception as e:
-logger.error(‘Scan failed: %s’, e)
-return
-if not tip:
-logger.info(‘Scan: no qualifying tip found.’)
-return
-tid = tip_id(tip)
-now = datetime.now(timezone.utc)
-kickoff = None
-try:
-ks = tip.get(‘kickoff_utc’, ‘’)
-kickoff = datetime.fromisoformat(ks.replace(‘Z’, ‘+00:00’))
-if kickoff.tzinfo is None:
-kickoff = kickoff.replace(tzinfo=timezone.utc)
-except Exception:
-pass
-if kickoff and kickoff > now:
-send_time = kickoff - timedelta(hours=1)
-if send_time <= now:
-ctx.job_queue.run_once(send_tip_job, when=5, data=tip, name=tid)
-logger.info(‘Tip firing immediately: %s’, tid)
-else:
-secs = (send_time - now).total_seconds()
-ctx.job_queue.run_once(send_tip_job, when=secs, data=tip, name=tid)
-scheduled_tip[‘tip’] = tip
-scheduled_tip[‘send_time’] = send_time
-logger.info(‘Tip scheduled at %s EST’, send_time.astimezone(EST).strftime(’%H:%M’))
-else:
-ctx.job_queue.run_once(send_tip_job, when=5, data=tip, name=tid)
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-kb = [
-[InlineKeyboardButton(‘Today's Tip’,    callback_data=‘tips’)],
-[InlineKeyboardButton(‘Daily Summary’,    callback_data=‘summary’)],
-[InlineKeyboardButton(‘Today's Results’, callback_data=‘results’)],
-[InlineKeyboardButton(‘How It Works’,     callback_data=‘howto’)],
-]
-await update.message.reply_text(
-‘Value Bet Bot\n\n1 tip per day.\nBest odds 1.30-1.50 across all sports.\nSent 1 hour before kickoff.\nResults at 11pm EST.’,
-reply_markup=InlineKeyboardMarkup(kb),
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
 
-async def tips_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-msg = await update.message.reply_text(‘Fetching best tip…’)
-try:
-tip = await get_best_tip()
-except Exception as e:
-await msg.edit_text(’Error: ’ + str(e))
-return
-if not tip:
-await msg.edit_text(‘No tips in the 1.30-1.50 range right now.’)
-return
-await msg.delete()
-await update.message.reply_text(tip_card(tip))
+# ---------------------------------------------------------------------------
+# Config  (set as Railway environment variables)
+# ---------------------------------------------------------------------------
 
-async def summary_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-try:
-text = await get_daily_summary()
-except Exception as e:
-text = ‘Error: ’ + str(e)
-reset_if_new_day()
-if scheduled_tip.get(‘send_time’):
-text += ‘\nScheduled for: ’ + scheduled_tip[‘send_time’].astimezone(EST).strftime(’%H:%M EST’)
-elif sent_today[‘tip_sent’]:
-text += ‘\nTip sent today.’
-else:
-text += ‘\nNo tip scheduled yet. Scan runs at 6am EST.’
-await update.message.reply_text(text)
+BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
+ATL        = ZoneInfo("America/Halifax")
 
-async def results_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-msg = await update.message.reply_text(‘Checking results…’)
-reset_if_new_day()
-if not sent_today[‘tip’]:
-await msg.edit_text(‘No tip sent today yet.’)
-return
-try:
-tip_results = await get_results([sent_today[‘tip’]])
-summary = build_results_summary(tip_results, datetime.now(EST).strftime(’%d %b %Y’))
-await msg.edit_text(summary)
-except Exception as e:
-await msg.edit_text(’Error: ’ + str(e))
+# ---------------------------------------------------------------------------
+# In-memory state  (resets on redeploy — fine for a daily bot)
+# ---------------------------------------------------------------------------
 
-async def diagnose_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-msg = await update.message.reply_text(‘Running diagnostics…’)
-try:
-report = await run_diagnostic()
-except Exception as e:
-await msg.edit_text(’Diagnostic error: ’ + str(e))
-return
-await msg.edit_text(report)
+state: dict = {
+    "tip":      None,   # today's best tip dict | None
+    "tip_sent": False,  # True once the signal message is posted
+    "send_job": None,   # APScheduler one-shot job reference
+}
 
-async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-query = update.callback_query
-await query.answer()
-if query.data == ‘tips’:
-try:
-tip = await get_best_tip()
-except Exception as e:
-await query.edit_message_text(‘Error: ’ + str(e))
-return
-if not tip:
-await query.edit_message_text(‘No tips in the 1.30-1.50 range right now.’)
-return
-await query.edit_message_text(tip_card(tip))
-elif query.data == ‘summary’:
-await query.edit_message_text(await get_daily_summary())
-elif query.data == ‘results’:
-reset_if_new_day()
-if not sent_today[‘tip’]:
-await query.edit_message_text(‘No tip sent today yet.’)
-return
-try:
-tip_results = await get_results([sent_today[‘tip’]])
-summary = build_results_summary(tip_results, datetime.now(EST).strftime(’%d %b %Y’))
-await query.edit_message_text(summary)
-except Exception as e:
-await query.edit_message_text(’Error: ’ + str(e))
-elif query.data == ‘howto’:
-await query.edit_message_text(
-‘How It Works\n\n’
-‘Every day at 6am EST the bot scans all sports for the best tip with odds 1.30-1.50.\n\n’
-‘The tip is sent 1 hour before kickoff.\n\n’
-‘At 11pm EST a results summary shows WIN or LOSS.\n\n’
-‘Gamble responsibly.’
-)
+# ---------------------------------------------------------------------------
+# Sport labels
+# ---------------------------------------------------------------------------
 
-async def post_results_summary(ctx: ContextTypes.DEFAULT_TYPE):
-reset_if_new_day()
-scheduled_tip.clear()
-if not sent_today[‘tip’]:
-logger.info(‘Results: no tip sent today.’)
-return
-try:
-tip_results = await get_results([sent_today[‘tip’]])
-summary = build_results_summary(tip_results, datetime.now(EST).strftime(’%d %b %Y’))
-await ctx.bot.send_message(CHANNEL_ID, summary)
-logger.info(‘Results posted.’)
-except Exception as e:
-logger.error(‘Results failed: %s’, e)
+SPORT_LABELS = {
+    "soccer_epl":                "⚽ EPL",
+    "soccer_spain_la_liga":      "⚽ La Liga",
+    "soccer_germany_bundesliga": "⚽ Bundesliga",
+    "soccer_italy_serie_a":      "⚽ Serie A",
+    "soccer_uefa_champs_league": "⚽ Champions League",
+    "soccer_australia_aleague":  "⚽ A-League",
+    "soccer_japan_j_league":     "⚽ J-League",
+    "basketball_nba":            "🏀 NBA",
+    "americanfootball_nfl":      "🏈 NFL",
+    "baseball_mlb":              "⚾ MLB",
+}
 
-async def push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-if update.effective_user.id != ADMIN_ID:
-await update.message.reply_text(‘Admin only.’)
-return
-await update.message.reply_text(‘Triggering daily scan…’)
-await daily_scan(ctx)
-if scheduled_tip.get(‘send_time’):
-t = scheduled_tip[‘send_time’].astimezone(EST).strftime(’%H:%M EST’)
-await update.message.reply_text(’Done. Tip scheduled for ’ + t)
-elif sent_today[‘tip_sent’]:
-await update.message.reply_text(‘Done. Tip sent to channel.’)
-else:
-await update.message.reply_text(‘Done. No qualifying tip found right now.’)
+def sport_label(sport: str) -> str:
+    return SPORT_LABELS.get(sport, sport)
 
-def main():
-app = Application.builder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler(‘start’,    start))
-app.add_handler(CommandHandler(‘tips’,     tips_command))
-app.add_handler(CommandHandler(‘summary’,  summary_command))
-app.add_handler(CommandHandler(‘results’,  results_command))
-app.add_handler(CommandHandler(‘push’,     push))
-app.add_handler(CommandHandler(‘diagnose’, diagnose_command))
-app.add_handler(CallbackQueryHandler(button))
+# ---------------------------------------------------------------------------
+# Confidence bar  e.g. 73.5% → "███████░░░"
+# ---------------------------------------------------------------------------
 
-```
-app.job_queue.run_daily(daily_scan,           time=dtime(hour=11, minute=0))
-app.job_queue.run_daily(post_results_summary, time=dtime(hour=4,  minute=0))
+def confidence_bar(pct: float, width: int = 10) -> str:
+    filled = round(pct / 100 * width)
+    return "█" * filled + "░" * (width - filled)
 
-logger.info('Bot running. 1 scan at 6am EST. Tip sent 1 hour before kickoff.')
-app.run_polling(drop_pending_updates=True)
-```
+# ---------------------------------------------------------------------------
+# Message builders
+# ---------------------------------------------------------------------------
 
-if **name** == ‘**main**’:
-main()
+def build_tip_message(tip: dict) -> str:
+    ko_str  = tip["kickoff_atl"].strftime("%I:%M %p AT")
+    bar     = confidence_bar(tip["confidence"])
+    conf    = tip["confidence"]
+    return (
+        f"🎯 *BetIntelHQ — Daily Signal*\n\n"
+        f"{sport_label(tip['sport'])}\n"
+        f"📋 *Match:* {tip['home_team']} vs {tip['away_team']}\n"
+        f"✅ *Pick:* {tip['pick']}\n"
+        f"💰 *Odds:* {tip['odds']:.2f}\n"
+        f"📚 *Best book:* {tip['bookmaker']} "
+        f"({tip['book_count']} books checked)\n"
+        f"📊 *Confidence:* {bar} {conf}%\n"
+        f"⏰ *Kickoff:* {ko_str}\n\n"
+        f"_Stake responsibly. 1 unit max._"
+    )
+
+
+def build_no_tip_message() -> str:
+    date_str = datetime.now(ATL).strftime("%A, %B %d")
+    return (
+        f"🔍 *BetIntelHQ — {date_str}*\n\n"
+        f"Scan complete. No tip meets today's confidence threshold "
+        f"(odds 1.30–1.50, multi-book agreement required).\n\n"
+        f"Rest day — protect the bankroll. 🧘"
+    )
+
+
+def build_summary_message() -> str:
+    date_str = datetime.now(ATL).strftime("%A, %B %d %Y")
+    tip = state["tip"]
+
+    if not tip or not state["tip_sent"]:
+        return (
+            f"📊 *BetIntelHQ — Summary ({date_str})*\n\n"
+            "No signal was issued today."
+        )
+
+    ko_str = tip["kickoff_atl"].strftime("%I:%M %p AT")
+    bar    = confidence_bar(tip["confidence"])
+    return (
+        f"📊 *BetIntelHQ — Summary ({date_str})*\n\n"
+        f"{sport_label(tip['sport'])}\n"
+        f"📋 {tip['home_team']} vs {tip['away_team']}\n"
+        f"✅ Pick: *{tip['pick']}* @ {tip['odds']:.2f}\n"
+        f"📊 Confidence: {bar} {tip['confidence']}%\n"
+        f"⏰ Kickoff was: {ko_str}\n\n"
+        f"_Check your bookmaker for the result. "
+        f"Track your units and stay disciplined._"
+    )
+
+# ---------------------------------------------------------------------------
+# Core jobs
+# ---------------------------------------------------------------------------
+
+async def job_daily_scan(scheduler: AsyncIOScheduler) -> None:
+    """06:00 AT — run the full scan and queue the tip send."""
+    logger.info("=== Daily scan starting ===")
+
+    # Reset state
+    state["tip"]      = None
+    state["tip_sent"] = False
+    if state["send_job"]:
+        try:
+            state["send_job"].remove()
+        except Exception:
+            pass
+        state["send_job"] = None
+
+    tip = get_best_tip()
+    state["tip"] = tip
+    bot = Bot(token=BOT_TOKEN)
+
+    if not tip:
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=build_no_tip_message(),
+            parse_mode="Markdown",
+        )
+        logger.info("No qualifying tip — rest day message sent.")
+        return
+
+    # Queue send for KO - 1 hour
+    send_at  = tip["kickoff_atl"] - timedelta(hours=1)
+    now_atl  = datetime.now(ATL)
+
+    if send_at <= now_atl:
+        # Already within 1 h of kickoff — send immediately
+        logger.warning(
+            "Kickoff %s is within 1 h of scan — sending tip now.",
+            tip["kickoff_atl"].strftime("%I:%M %p AT"),
+        )
+        await _send_tip(bot)
+    else:
+        job = scheduler.add_job(
+            _send_tip_scheduled,
+            trigger="date",
+            run_date=send_at,
+            id="send_tip",
+            replace_existing=True,
+        )
+        state["send_job"] = job
+        logger.info(
+            "Tip queued: will send at %s AT  (KO %s AT)",
+            send_at.strftime("%I:%M %p"),
+            tip["kickoff_atl"].strftime("%I:%M %p"),
+        )
+
+
+async def _send_tip(bot: Bot) -> None:
+    """Post the tip message. Shared by immediate and scheduled paths."""
+    tip = state["tip"]
+    if not tip:
+        logger.warning("_send_tip called with no tip in state.")
+        return
+
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=build_tip_message(tip),
+        parse_mode="Markdown",
+    )
+    state["tip_sent"] = True
+    logger.info("Signal sent: %s @ %.2f (confidence %.1f%%)",
+                tip["pick"], tip["odds"], tip["confidence"])
+
+
+async def _send_tip_scheduled() -> None:
+    """APScheduler async entry point for the queued send."""
+    bot = Bot(token=BOT_TOKEN)
+    await _send_tip(bot)
+
+
+async def job_results_summary() -> None:
+    """23:00 AT — post the day's summary."""
+    bot = Bot(token=BOT_TOKEN)
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=build_summary_message(),
+        parse_mode="Markdown",
+    )
+    logger.info("Results summary posted.")
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+def build_scheduler(app) -> AsyncIOScheduler:
+    scheduler = AsyncIOScheduler(timezone=ATL)
+
+    scheduler.add_job(
+        job_daily_scan,
+        trigger="cron",
+        hour=6, minute=0,
+        kwargs={"scheduler": scheduler},
+        id="daily_scan",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        job_results_summary,
+        trigger="cron",
+        hour=23, minute=0,
+        id="results_summary",
+        replace_existing=True,
+    )
+
+    return scheduler
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    scheduler = build_scheduler(app)
+    scheduler.start()
+    logger.info("BetIntelHQ live — next scan at 06:00 AT (Halifax)")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
